@@ -19,21 +19,21 @@ mod tests {
     use super::normalize_code;
 
     #[test]
-    fn bare_code_is_trimmed_but_unchanged() {
-        assert_eq!(normalize_code("wzUIkaNl6u"), "wzUIkaNl6u");
-        assert_eq!(normalize_code("  wzUIkaNl6u  "), "wzUIkaNl6u");
+    fn bare_code_is_trimmed_and_lowercased() {
+        assert_eq!(normalize_code("k7m4qp"), "k7m4qp");
+        assert_eq!(normalize_code("  K7M4QP  "), "k7m4qp");
     }
 
     #[test]
     fn extracts_code_from_pasted_link_or_hash() {
         assert_eq!(
-            normalize_code("http://localhost:3000/#/room/wzUIkaNl6u"),
-            "wzUIkaNl6u"
+            normalize_code("http://localhost:3000/#/room/K7m4QP"),
+            "k7m4qp"
         );
-        assert_eq!(normalize_code("#/room/abc123"), "abc123");
+        assert_eq!(normalize_code("#/room/abc23"), "abc23");
         assert_eq!(
-            normalize_code("https://file-send.app/#/room/k7f2-9xqz/"),
-            "k7f2-9xqz"
+            normalize_code("https://file-send.app/#/room/k7m4qp/"),
+            "k7m4qp"
         );
     }
 
@@ -66,14 +66,16 @@ mod tests {
 }
 
 /// Extract a bare room code from user input. Accepts either a raw code or a
-/// pasted link/hash like `https://host/#/room/<code>`; returns the trimmed code
-/// (everything after the last `room/`, stripped of surrounding slashes).
+/// pasted link/hash like `https://host/#/room/<code>`; returns the code
+/// (everything after the last `room/`, stripped of surrounding slashes) trimmed
+/// and lowercased, since room codes are always lowercase.
 fn normalize_code(raw: &str) -> String {
     let s = raw.trim();
-    match s.rfind("room/") {
-        Some(idx) => s[idx + "room/".len()..].trim_matches('/').trim().to_string(),
-        None => s.to_string(),
-    }
+    let code = match s.rfind("room/") {
+        Some(idx) => s[idx + "room/".len()..].trim_matches('/').trim(),
+        None => s,
+    };
+    code.to_ascii_lowercase()
 }
 
 /// Choose the origin for share links: a non-empty compile-time override wins

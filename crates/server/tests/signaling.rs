@@ -8,7 +8,12 @@ async fn start_server() -> String {
     let addr = listener.local_addr().unwrap();
     let app = server::app("nonexistent-dist".to_string());
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     format!("ws://{addr}/ws")
 }

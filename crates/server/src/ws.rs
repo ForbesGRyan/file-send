@@ -1,21 +1,36 @@
 //! WebSocket signaling: one connection per peer, relays messages to partner.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     response::Response,
 };
 use shared::SignalMsg;
 use tokio::sync::mpsc;
 
+use crate::limiter::JoinLimiter;
 use crate::rooms::{JoinOutcome, PeerId, RoomRegistry};
+
+/// Sliding window for the per-IP join-attempt rate limit.
+const JOIN_WINDOW_MS: u64 = 60_000;
+/// Max failed join attempts per IP within `JOIN_WINDOW_MS`. Generous for humans
+/// (who typically attempt once) but throttles online enumeration of room codes
+/// to a rate that makes brute force infeasible.
+const JOIN_MAX_FAILURES: usize = 30;
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 /// Shared application state, cloned cheaply (Arc) into every handler.
 #[derive(Clone)]
@@ -24,6 +39,8 @@ pub struct AppState {
     /// Per-peer outbound channel senders, so a peer can push to its partner.
     senders: Arc<Mutex<std::collections::HashMap<PeerId, mpsc::UnboundedSender<SignalMsg>>>>,
     next_id: Arc<AtomicU64>,
+    /// Per-IP rate limiter for room-join attempts.
+    join_limiter: Arc<Mutex<JoinLimiter>>,
 }
 
 impl AppState {
@@ -32,6 +49,7 @@ impl AppState {
             registry: Arc::new(Mutex::new(RoomRegistry::new())),
             senders: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            join_limiter: Arc::new(Mutex::new(JoinLimiter::new(JOIN_WINDOW_MS, JOIN_MAX_FAILURES))),
         }
     }
 
@@ -50,11 +68,16 @@ impl Default for AppState {
 }
 
 /// Axum handler for `GET /ws`: upgrades to a WebSocket.
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    let ip = addr.ip();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, ip))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
     use futures_util::{SinkExt, StreamExt};
 
     let peer_id = state.next_id.fetch_add(1, Ordering::Relaxed);
@@ -80,7 +103,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Ok(parsed) = serde_json::from_str::<SignalMsg>(&text) else {
                     continue;
                 };
-                handle_message(&recv_state, peer_id, parsed);
+                handle_message(&recv_state, peer_id, ip, parsed);
             } else if let Message::Close(_) = msg {
                 break;
             }
@@ -100,17 +123,37 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.senders.lock().unwrap().remove(&peer_id);
 }
 
-/// Apply one inbound signaling message.
-fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
+/// Room-code alphabet: lowercase letters and digits with visually ambiguous
+/// characters removed (no `i`, `l`, `o`, `0`, `1`). 31 symbols.
+const ROOM_ALPHABET: [char; 31] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', '2', '3', '4', '5', '6', '7', '8', '9',
+];
+
+/// Generate a short, easy-to-type room code: 6 chars from `ROOM_ALPHABET`.
+fn gen_room_id() -> String {
+    nanoid::nanoid!(6, &ROOM_ALPHABET)
+}
+
+/// Apply one inbound signaling message. `ip` is the peer's source address, used
+/// to rate-limit join attempts.
+fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
     match msg {
         SignalMsg::Create => {
-            let room_id = nanoid::nanoid!(10);
+            let room_id = gen_room_id();
             let outcome = state.registry.lock().unwrap().create(peer, room_id);
             if let JoinOutcome::Created(room) = outcome {
                 state.send_to(peer, SignalMsg::Created { room });
             }
         }
         SignalMsg::Join { room } => {
+            let now = now_ms();
+            // Throttle enumeration: an IP over its recent failed-attempt budget
+            // is told the room doesn't exist, without touching the registry.
+            if !state.join_limiter.lock().unwrap().allowed(ip, now) {
+                state.send_to(peer, SignalMsg::RoomNotFound);
+                return;
+            }
             let outcome = state.registry.lock().unwrap().join(peer, &room);
             match outcome {
                 JoinOutcome::Joined => {
@@ -119,8 +162,14 @@ fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
                         state.send_to(partner, SignalMsg::PeerJoined);
                     }
                 }
-                JoinOutcome::Full => state.send_to(peer, SignalMsg::RoomFull),
-                JoinOutcome::NotFound => state.send_to(peer, SignalMsg::RoomNotFound),
+                JoinOutcome::Full => {
+                    state.join_limiter.lock().unwrap().record_failure(ip, now);
+                    state.send_to(peer, SignalMsg::RoomFull);
+                }
+                JoinOutcome::NotFound => {
+                    state.join_limiter.lock().unwrap().record_failure(ip, now);
+                    state.send_to(peer, SignalMsg::RoomNotFound);
+                }
                 JoinOutcome::Created(_) => {}
             }
         }
@@ -133,5 +182,22 @@ fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
         }
         // Server-originated variants are ignored if received from a client.
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gen_room_id, ROOM_ALPHABET};
+
+    #[test]
+    fn room_id_is_six_chars_from_alphabet() {
+        for _ in 0..100 {
+            let id = gen_room_id();
+            assert_eq!(id.chars().count(), 6, "id {id:?} should be 6 chars");
+            assert!(
+                id.chars().all(|c| ROOM_ALPHABET.contains(&c)),
+                "id {id:?} contains a char outside the alphabet"
+            );
+        }
     }
 }

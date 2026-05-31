@@ -1,3 +1,4 @@
+pub mod limiter;
 pub mod rooms;
 pub mod ws;
 
