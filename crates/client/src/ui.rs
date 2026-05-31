@@ -49,20 +49,22 @@ pub fn StatusBar(status: ReadSignal<Status>) -> impl IntoView {
 pub fn ProgressList(items: ReadSignal<Vec<FileProgress>>) -> impl IntoView {
     view! {
         <ul class="progress-list">
-            <For
-                each=move || items.get()
-                key=|p| (p.name.clone(), p.direction)
-                children=|p: FileProgress| {
-                    let pct = (p.fraction * 100.0).round();
-                    view! {
-                        <li>
-                            <span>{p.direction}" "{p.name.clone()}</span>
-                            <progress max="100" value=move || pct></progress>
-                            <span>{pct}"%"</span>
-                        </li>
-                    }
-                }
-            />
+            {move || {
+                items
+                    .get()
+                    .into_iter()
+                    .map(|p| {
+                        let pct = (p.fraction * 100.0).round();
+                        view! {
+                            <li>
+                                <span>{p.direction}" "{p.name.clone()}</span>
+                                <progress max="100" value=pct></progress>
+                                <span>{pct}"%"</span>
+                            </li>
+                        }
+                    })
+                    .collect_view()
+            }}
         </ul>
     }
 }
