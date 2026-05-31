@@ -1,6 +1,11 @@
-//! File send (chunk + backpressure) and receive (reassemble + download).
+//! File transfer over the data channel with an accept-before-transfer handshake.
+//!
+//! The sender announces each file with `Offer` (no bytes). The receiver replies
+//! `Accept{id}` or `Reject{id}`. Accepted files are streamed sequentially as
+//! `Start` -> binary chunks -> `End`, reassembled, and saved.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
@@ -13,9 +18,196 @@ use crate::protocol::{decode_control, encode_control, Control, FileEnd, FileStar
 /// High-water mark for buffered bytes; pause sending above this.
 const BUFFER_HIGH: f64 = 1_000_000.0;
 
-/// Send one file over the data channel, reporting progress as bytes sent.
-/// `id` must be unique per file in the session.
-pub async fn send_file(
+/// UI callbacks for transfer events. All are `Rc<dyn Fn..>` so they can be
+/// cloned into the message router and the async sender task.
+#[derive(Clone)]
+pub struct Handlers {
+    /// An incoming file was offered; show an accept/decline prompt.
+    pub on_offer: Rc<dyn Fn(FileStart)>,
+    /// Receiving progress for incoming file `id`: (id, name, received, total).
+    pub on_recv_progress: Rc<dyn Fn(u64, String, f64, f64)>,
+    /// Incoming file `id` finished and was saved: (id, name).
+    pub on_recv_complete: Rc<dyn Fn(u64, String)>,
+    /// Sending progress for outgoing file `id`: (id, name, sent, total).
+    pub on_send_progress: Rc<dyn Fn(u64, String, f64, f64)>,
+    /// Outgoing file `id` was declined by the peer.
+    pub on_rejected: Rc<dyn Fn(u64)>,
+}
+
+/// Receiver state for the current incoming file.
+#[derive(Default)]
+struct Incoming {
+    meta: Option<FileStart>,
+    chunks: Vec<js_sys::Uint8Array>,
+    received: f64,
+}
+
+/// Sender state: offered files awaiting a decision, the accepted queue, and a
+/// flag indicating the drain task is running.
+#[derive(Default)]
+struct Outgoing {
+    offered: HashMap<u64, File>,
+    queue: VecDeque<(u64, File)>,
+    sending: bool,
+}
+
+/// State shared between the control router and the sender drain task.
+struct Shared {
+    dc: RtcDataChannel,
+    handlers: Handlers,
+    next_id: Cell<u64>,
+    incoming: RefCell<Incoming>,
+    outgoing: RefCell<Outgoing>,
+}
+
+/// Handle to a data channel wired for the accept-before-transfer protocol.
+#[derive(Clone)]
+pub struct Transfer {
+    shared: Rc<Shared>,
+}
+
+impl Transfer {
+    /// Wrap `dc`: install the control router and return a handle.
+    pub fn new(dc: RtcDataChannel, handlers: Handlers) -> Transfer {
+        dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+        let shared = Rc::new(Shared {
+            dc,
+            handlers,
+            next_id: Cell::new(0),
+            incoming: RefCell::new(Incoming::default()),
+            outgoing: RefCell::new(Outgoing::default()),
+        });
+        install_router(&shared);
+        Transfer { shared }
+    }
+
+    /// Is the underlying channel open?
+    pub fn is_open(&self) -> bool {
+        self.shared.dc.ready_state() == web_sys::RtcDataChannelState::Open
+    }
+
+    /// Announce `files` to the peer (one `Offer` each). Returns the offered
+    /// `(id, name, size)` list so the caller can render outgoing rows.
+    pub fn offer_files(&self, files: Vec<File>) -> Vec<(u64, String, f64)> {
+        let mut offered = Vec::new();
+        for file in files {
+            let id = self.shared.next_id.get();
+            self.shared.next_id.set(id + 1);
+            let meta = FileStart {
+                id,
+                name: file.name(),
+                size: file.size(),
+                mime: file.type_(),
+            };
+            let _ = self.shared.dc.send_with_str(&encode_control(&Control::Offer(meta.clone())));
+            offered.push((id, meta.name.clone(), meta.size));
+            self.shared.outgoing.borrow_mut().offered.insert(id, file);
+        }
+        offered
+    }
+
+    /// Accept an incoming offered file (sends `Accept{id}` to the sender).
+    pub fn accept(&self, id: u64) {
+        let _ = self.shared.dc.send_with_str(&encode_control(&Control::Accept { id }));
+    }
+
+    /// Decline an incoming offered file (sends `Reject{id}`).
+    pub fn reject(&self, id: u64) {
+        let _ = self.shared.dc.send_with_str(&encode_control(&Control::Reject { id }));
+    }
+
+    /// Set the channel's `onopen` handler (takes ownership of the closure).
+    pub fn channel_set_onopen(&self, cb: wasm_bindgen::closure::Closure<dyn FnMut()>) {
+        self.shared.dc.set_onopen(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+}
+
+/// Install the unified control/message router on the channel.
+fn install_router(shared: &Rc<Shared>) {
+    let shared_for_cb = shared.clone();
+    let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+        let shared = &shared_for_cb;
+        let data = e.data();
+        if let Some(text) = data.as_string() {
+            match decode_control(&text) {
+                // Receiver role.
+                Some(Control::Offer(meta)) => (shared.handlers.on_offer)(meta),
+                Some(Control::Start(meta)) => {
+                    let mut inc = shared.incoming.borrow_mut();
+                    inc.meta = Some(meta);
+                    inc.chunks.clear();
+                    inc.received = 0.0;
+                }
+                Some(Control::End(_)) => finalize(shared),
+                // Sender role.
+                Some(Control::Accept { id }) => on_accept(shared, id),
+                Some(Control::Reject { id }) => {
+                    shared.outgoing.borrow_mut().offered.remove(&id);
+                    (shared.handlers.on_rejected)(id);
+                }
+                None => {}
+            }
+        } else {
+            // Binary chunk (receiver role).
+            let array = js_sys::Uint8Array::new(&data);
+            let progress = {
+                let mut inc = shared.incoming.borrow_mut();
+                inc.received += array.length() as f64;
+                inc.chunks.push(array);
+                inc.meta.as_ref().map(|m| (m.id, m.name.clone(), m.size, inc.received))
+            };
+            if let Some((id, name, total, recv)) = progress {
+                (shared.handlers.on_recv_progress)(id, name, recv, total);
+            }
+        }
+    });
+    shared.dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+    cb.forget();
+}
+
+/// Sender: an offered file was accepted — queue it and start draining if idle.
+fn on_accept(shared: &Rc<Shared>, id: u64) {
+    let start_drain = {
+        let mut out = shared.outgoing.borrow_mut();
+        if let Some(file) = out.offered.remove(&id) {
+            out.queue.push_back((id, file));
+        }
+        if !out.sending && !out.queue.is_empty() {
+            out.sending = true;
+            true
+        } else {
+            false
+        }
+    };
+    if start_drain {
+        spawn_local(drain(shared.clone()));
+    }
+}
+
+/// Sender: stream accepted files one at a time until the queue is empty.
+async fn drain(shared: Rc<Shared>) {
+    loop {
+        let next = shared.outgoing.borrow_mut().queue.pop_front();
+        let Some((id, file)) = next else {
+            shared.outgoing.borrow_mut().sending = false;
+            return;
+        };
+        let name = file.name();
+        let total = file.size();
+        let prog = {
+            let shared = shared.clone();
+            let name = name.clone();
+            move |sent: f64| (shared.handlers.on_send_progress)(id, name.clone(), sent, total)
+        };
+        let _ = send_file(shared.dc.clone(), id, file, prog).await;
+        // Guarantee a final 100% (also covers 0-byte files that emit no chunks).
+        (shared.handlers.on_send_progress)(id, name, total, total);
+    }
+}
+
+/// Send one file: `Start` -> chunks (with backpressure) -> `End`.
+async fn send_file(
     dc: RtcDataChannel,
     id: u64,
     file: File,
@@ -34,12 +226,10 @@ pub async fn send_file(
     let mut sent: f64 = 0.0;
     while offset < size {
         let end = (offset + CHUNK_SIZE as f64).min(size);
-        // Slice the file lazily; only this chunk is read into memory.
         let blob = file.slice_with_f64_and_f64(offset, end)?;
         let buf = JsFuture::from(blob.array_buffer()).await?;
         let array = js_sys::Uint8Array::new(&buf);
 
-        // Backpressure: wait while the channel's send buffer is too full.
         while dc.buffered_amount() as f64 > BUFFER_HIGH {
             yield_to_event_loop().await;
         }
@@ -63,64 +253,13 @@ async fn yield_to_event_loop() {
     .await;
 }
 
-/// State accumulated while receiving the current file.
-#[derive(Default)]
-struct Incoming {
-    meta: Option<FileStart>,
-    chunks: Vec<js_sys::Uint8Array>,
-    received: f64,
-}
-
-/// Attach receive handling to a data channel. `on_progress(name, received, total)`
-/// fires per chunk; `on_complete(name)` fires when a file finishes and its
-/// download has been triggered.
-pub fn attach_receiver(
-    dc: &RtcDataChannel,
-    on_progress: impl Fn(String, f64, f64) + 'static,
-    on_complete: impl Fn(String) + 'static,
-) {
-    dc.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
-    let state = Rc::new(RefCell::new(Incoming::default()));
-
-    let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-        let data = e.data();
-        if let Some(text) = data.as_string() {
-            // Control frame.
-            match decode_control(&text) {
-                Some(Control::Start(meta)) => {
-                    let mut s = state.borrow_mut();
-                    s.meta = Some(meta);
-                    s.chunks.clear();
-                    s.received = 0.0;
-                }
-                Some(Control::End(_)) => {
-                    finalize(&state, &on_complete);
-                }
-                // Offer/Accept/Reject handled in a future task.
-                Some(_) | None => {}
-            }
-        } else {
-            // Binary chunk.
-            let array = js_sys::Uint8Array::new(&data);
-            let mut s = state.borrow_mut();
-            s.received += array.length() as f64;
-            s.chunks.push(array);
-            if let Some(meta) = &s.meta {
-                on_progress(meta.name.clone(), s.received, meta.size);
-            }
-        }
-    });
-    dc.set_onmessage(Some(cb.as_ref().unchecked_ref()));
-    cb.forget();
-}
-
 /// Assemble received chunks into a Blob and trigger a browser download.
-fn finalize(state: &Rc<RefCell<Incoming>>, on_complete: &impl Fn(String)) {
+fn finalize(shared: &Rc<Shared>) {
     let (meta, parts) = {
-        let mut s = state.borrow_mut();
-        let meta = s.meta.take();
-        let parts = std::mem::take(&mut s.chunks);
-        s.received = 0.0;
+        let mut inc = shared.incoming.borrow_mut();
+        let meta = inc.meta.take();
+        let parts = std::mem::take(&mut inc.chunks);
+        inc.received = 0.0;
         (meta, parts)
     };
     let Some(meta) = meta else { return };
@@ -135,7 +274,7 @@ fn finalize(state: &Rc<RefCell<Incoming>>, on_complete: &impl Fn(String)) {
         return;
     };
     trigger_download(&blob, &meta.name);
-    on_complete(meta.name);
+    (shared.handlers.on_recv_complete)(meta.id, meta.name);
 }
 
 /// Create an object URL for the blob and click a temporary anchor to download.
@@ -152,26 +291,5 @@ fn trigger_download(blob: &Blob, filename: &str) {
     spawn_local(async move {
         yield_to_event_loop().await;
         let _ = Url::revoke_object_url(&url);
-    });
-}
-
-/// Drain a queue of files sequentially over the data channel.
-pub fn send_files(
-    dc: RtcDataChannel,
-    files: Vec<File>,
-    on_progress: impl Fn(String, f64, f64) + Clone + 'static,
-    on_done: impl Fn() + 'static,
-) {
-    spawn_local(async move {
-        for (i, file) in files.into_iter().enumerate() {
-            let name = file.name();
-            let total = file.size();
-            let prog = on_progress.clone();
-            let _ = send_file(dc.clone(), i as u64, file, move |sent| {
-                prog(name.clone(), sent, total);
-            })
-            .await;
-        }
-        on_done();
     });
 }
