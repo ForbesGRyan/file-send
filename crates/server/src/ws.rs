@@ -100,11 +100,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.senders.lock().unwrap().remove(&peer_id);
 }
 
+/// Room-code alphabet: lowercase letters and digits with visually ambiguous
+/// characters removed (no `i`, `l`, `o`, `0`, `1`). 31 symbols.
+const ROOM_ALPHABET: [char; 31] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', '2', '3', '4', '5', '6', '7', '8', '9',
+];
+
+/// Generate a short, easy-to-type room code: 6 chars from `ROOM_ALPHABET`.
+fn gen_room_id() -> String {
+    nanoid::nanoid!(6, &ROOM_ALPHABET)
+}
+
 /// Apply one inbound signaling message.
 fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
     match msg {
         SignalMsg::Create => {
-            let room_id = nanoid::nanoid!(10);
+            let room_id = gen_room_id();
             let outcome = state.registry.lock().unwrap().create(peer, room_id);
             if let JoinOutcome::Created(room) = outcome {
                 state.send_to(peer, SignalMsg::Created { room });
@@ -133,5 +145,22 @@ fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
         }
         // Server-originated variants are ignored if received from a client.
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gen_room_id, ROOM_ALPHABET};
+
+    #[test]
+    fn room_id_is_six_chars_from_alphabet() {
+        for _ in 0..100 {
+            let id = gen_room_id();
+            assert_eq!(id.chars().count(), 6, "id {id:?} should be 6 chars");
+            assert!(
+                id.chars().all(|c| ROOM_ALPHABET.contains(&c)),
+                "id {id:?} contains a char outside the alphabet"
+            );
+        }
     }
 }
