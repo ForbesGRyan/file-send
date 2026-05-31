@@ -37,6 +37,10 @@ cargo run --release -p server     # serves crates/client/dist on :3000
 - `CLIENT_DIST` (server) — static dir, default `crates/client/dist`.
 - `STUN_URL` (client, compile-time) — STUN server, default
   `stun:stun.l.google.com:19302`.
+- `PUBLIC_ORIGIN` (client, compile-time) — origin used to build share
+  links/QR, e.g. `https://files.example.com`. Defaults to the browser's
+  runtime origin (`window.location.origin`); set this only when the public URL
+  differs from what the browser sees (e.g. behind a reverse proxy).
 
 ## Known limitation
 True P2P with no TURN relay. Peers behind symmetric NAT may fail to connect
