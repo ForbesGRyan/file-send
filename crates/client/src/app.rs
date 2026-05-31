@@ -28,7 +28,7 @@ pub fn App() -> impl IntoView {
     let (room_link, set_room_link) = signal(String::new());
     let (progress, set_progress) = signal(Vec::<FileProgress>::new());
     let (qr, set_qr) = signal(String::new());
-    let (drag_active, set_drag_active) = signal(false);
+    let (drag_depth, set_drag_depth) = signal(0i32);
 
     // Shared handles populated as the connection is established.
     let pc: Rc<RefCell<Option<RtcPeerConnection>>> = Rc::new(RefCell::new(None));
@@ -210,7 +210,7 @@ pub fn App() -> impl IntoView {
         let on_files = on_files.clone();
         move |ev: DragEvent| {
             ev.prevent_default();
-            set_drag_active.set(false);
+            set_drag_depth.set(0);
             let mut files = Vec::new();
             if let Some(dt) = ev.data_transfer() {
                 if let Some(list) = dt.files() {
@@ -241,7 +241,7 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    let drop_class = move || if drag_active.get() { "drop active" } else { "drop" };
+    let drop_class = move || if drag_depth.get() > 0 { "drop active" } else { "drop" };
 
     view! {
         <main class="container">
@@ -256,9 +256,9 @@ pub fn App() -> impl IntoView {
 
             <div
                 class=drop_class
-                on:dragenter=move |ev: DragEvent| { ev.prevent_default(); set_drag_active.set(true); }
+                on:dragenter=move |ev: DragEvent| { ev.prevent_default(); set_drag_depth.update(|d| *d += 1); }
                 on:dragover=move |ev: DragEvent| ev.prevent_default()
-                on:dragleave=move |_| set_drag_active.set(false)
+                on:dragleave=move |_| set_drag_depth.update(|d| if *d > 0 { *d -= 1; })
                 on:drop=on_drop
             >
                 <b>"Drop files here"</b>
