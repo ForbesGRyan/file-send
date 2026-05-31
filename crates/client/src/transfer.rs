@@ -96,7 +96,8 @@ pub fn attach_receiver(
                 Some(Control::End(_)) => {
                     finalize(&state, &on_complete);
                 }
-                None => {}
+                // Offer/Accept/Reject handled in a future task.
+                Some(_) | None => {}
             }
         } else {
             // Binary chunk.

@@ -27,7 +27,15 @@ pub struct FileEnd {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
+    /// Sender announces a file; no bytes follow until the receiver accepts.
+    Offer(FileStart),
+    /// Receiver accepts file `id`; the sender then streams it.
+    Accept { id: u64 },
+    /// Receiver declines file `id`.
+    Reject { id: u64 },
+    /// Byte stream for a file begins (sent only after an accept).
     Start(FileStart),
+    /// Byte stream for a file is complete.
     End(FileEnd),
 }
 
@@ -91,5 +99,31 @@ mod tests {
     #[test]
     fn empty_input_yields_no_chunks() {
         assert!(chunk_bytes(&[]).is_empty());
+    }
+
+    #[test]
+    fn control_roundtrip_offer() {
+        let c = Control::Offer(FileStart {
+            id: 3,
+            name: "b.bin".into(),
+            size: 99.0,
+            mime: "application/octet-stream".into(),
+        });
+        let s = encode_control(&c);
+        assert_eq!(decode_control(&s), Some(c));
+    }
+
+    #[test]
+    fn control_roundtrip_accept_reject() {
+        let a = Control::Accept { id: 5 };
+        let r = Control::Reject { id: 6 };
+        assert_eq!(decode_control(&encode_control(&a)), Some(a));
+        assert_eq!(decode_control(&encode_control(&r)), Some(r));
+    }
+
+    #[test]
+    fn offer_is_type_tagged() {
+        let c = Control::Offer(FileStart { id: 1, name: "x".into(), size: 0.0, mime: "".into() });
+        assert!(encode_control(&c).contains("\"type\":\"offer\""));
     }
 }
