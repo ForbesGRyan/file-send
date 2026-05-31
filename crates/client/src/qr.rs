@@ -9,9 +9,9 @@ pub fn qr_svg(data: &str) -> String {
         return String::new();
     };
     let width = code.width();
-    let quiet = 2usize; // quiet-zone modules around the code
+    let quiet = 4usize; // QR spec requires a 4-module quiet zone
     let dim = width + quiet * 2;
-    let colors = code.to_colors();
+    let colors = code.into_colors();
 
     let mut rects = String::new();
     for y in 0..width {
@@ -43,6 +43,8 @@ mod tests {
         let svg = qr_svg("https://file-send.app/#/room/abcd");
         assert!(svg.starts_with("<svg"), "should be an svg document");
         assert!(svg.contains("<rect"), "should contain module rects");
+        assert!(svg.contains("viewBox=\"0 0"), "should declare a viewBox");
+        assert!(svg.contains("fill=\"#ffffff\""), "should have a white background");
     }
 
     #[test]
