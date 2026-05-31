@@ -213,15 +213,11 @@ pub fn App() -> impl IntoView {
                 );
             }),
             on_rejected: Rc::new(move |id| {
-                upsert_row(id, false, &|| Row {
-                    id,
-                    name: String::new(),
-                    size: 0.0,
-                    kind: "FILE",
-                    incoming: false,
-                    fraction: 0.0,
-                    state: TransferState::Declined,
-                }, &|r| r.state = TransferState::Declined);
+                set_items.update(|list| {
+                    if let Some(r) = list.iter_mut().find(|r| r.id == id && !r.incoming) {
+                        r.state = TransferState::Declined;
+                    }
+                });
             }),
         }
     };
