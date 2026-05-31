@@ -97,10 +97,14 @@ pub async fn add_ice_candidate(pc: &RtcPeerConnection, candidate_json: &str) -> 
     Ok(())
 }
 
-/// Create the ordered+reliable data channel (initiator side).
-pub fn create_data_channel(pc: &RtcPeerConnection) -> RtcDataChannel {
+/// Create an ordered+reliable data channel with the given `label`.
+///
+/// The first channel (the control channel) bootstraps the SCTP transport via
+/// the initial SDP negotiation. Channels created afterwards — one per file —
+/// are multiplexed over that same transport and need no renegotiation.
+pub fn create_data_channel(pc: &RtcPeerConnection, label: &str) -> RtcDataChannel {
     // Default config is ordered + reliable, which is what we want.
-    pc.create_data_channel("file")
+    pc.create_data_channel(label)
 }
 
 /// Register a handler for the data channel created by the remote (joiner side).

@@ -47,7 +47,7 @@ pub fn fmt_size(bytes: f64) -> String {
 }
 
 /// Lifecycle state of one transfer row.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TransferState {
     /// Incoming: awaiting the local user's accept/decline. Outgoing: awaiting the peer.
     Offered,
@@ -57,6 +57,8 @@ pub enum TransferState {
     Done,
     /// Declined by the deciding side.
     Declined,
+    /// Aborted mid-transfer (receiver cancelled).
+    Cancelled,
 }
 
 /// One transfer's UI row. Rows are keyed by `(id, incoming)`.
@@ -68,6 +70,7 @@ pub struct Transfer {
     pub kind: &'static str, // type badge, e.g. "PDF"
     pub incoming: bool,     // true = receiving (peer -> me); false = sending
     pub fraction: f64,      // 0.0..=1.0
+    pub speed: f64,         // bytes/sec, receive-side estimate (0.0 = unknown)
     pub state: TransferState,
 }
 
@@ -86,6 +89,7 @@ pub fn ProgressList(
     items: ReadSignal<Vec<Transfer>>,
     on_accept: UnsyncCallback<u64>,
     on_decline: UnsyncCallback<u64>,
+    on_cancel: UnsyncCallback<u64>,
     on_accept_all: UnsyncCallback<()>,
 ) -> impl IntoView {
     // Show "Accept all" only when 2+ incoming offers are pending.
@@ -103,15 +107,25 @@ pub fn ProgressList(
                 items
                     .get()
                     .into_iter()
-                    .map(|t| transfer_row(t, on_accept, on_decline))
+                    .map(|t| transfer_row(t, on_accept, on_decline, on_cancel))
                     .collect_view()
             }}
         </ul>
     }
 }
 
+/// Format a transfer rate (bytes/sec) as a short string, e.g. "1.5 MB/s".
+fn fmt_speed(bytes_per_sec: f64) -> String {
+    format!("{}/s", fmt_size(bytes_per_sec))
+}
+
 /// Render one transfer row according to its state.
-fn transfer_row(t: Transfer, on_accept: UnsyncCallback<u64>, on_decline: UnsyncCallback<u64>) -> impl IntoView {
+fn transfer_row(
+    t: Transfer,
+    on_accept: UnsyncCallback<u64>,
+    on_decline: UnsyncCallback<u64>,
+    on_cancel: UnsyncCallback<u64>,
+) -> impl IntoView {
     let id = t.id;
     let pct = (t.fraction * 100.0).round();
     let arrow = if t.incoming { "↓" } else { "↑" };
@@ -146,24 +160,32 @@ fn transfer_row(t: Transfer, on_accept: UnsyncCallback<u64>, on_decline: UnsyncC
             </li>
         }
         .into_any(),
-        TransferState::Declined => view! {
-            <li class="row declined">
-                <div class="top">
-                    <span>
-                        <span class="diricon">{arrow}</span>" "
-                        <span class="name">{t.name.clone()}</span>" "
-                        <span class="tag">{t.kind}</span>
-                    </span>
-                    <span class="pct">"✗ DECLINED"</span>
-                </div>
-            </li>
+        TransferState::Declined | TransferState::Cancelled => {
+            let label = if t.state == TransferState::Cancelled { "✗ CANCELLED" } else { "✗ DECLINED" };
+            view! {
+                <li class="row declined">
+                    <div class="top">
+                        <span>
+                            <span class="diricon">{arrow}</span>" "
+                            <span class="name">{t.name.clone()}</span>" "
+                            <span class="tag">{t.kind}</span>
+                        </span>
+                        <span class="pct">{label}</span>
+                    </div>
+                </li>
+            }
+            .into_any()
         }
-        .into_any(),
         TransferState::Active | TransferState::Done => {
             let done = t.state == TransferState::Done;
             let row_class = if done { "row done" } else { "row" };
             let pct_label = if done { "✓ DONE".to_string() } else { format!("{pct}%") };
             let bar_style = format!("width:{pct}%");
+            // Live transfer rate, shown only while an incoming file is flowing.
+            let show_speed = t.incoming && !done && t.speed > 0.0;
+            let speed_label = fmt_speed(t.speed);
+            // Cancel is offered only on an in-progress download.
+            let show_cancel = t.incoming && !done;
             view! {
                 <li class=row_class>
                     <div class="top">
@@ -172,7 +194,15 @@ fn transfer_row(t: Transfer, on_accept: UnsyncCallback<u64>, on_decline: UnsyncC
                             <span class="name">{t.name.clone()}</span>" "
                             <span class="tag">{t.kind}</span>
                         </span>
-                        <span class="pct">{pct_label}</span>
+                        <span class="meta">
+                            <Show when=move || show_speed>
+                                <span class="speed">{speed_label.clone()}</span>
+                            </Show>
+                            <span class="pct">{pct_label.clone()}</span>
+                            <Show when=move || show_cancel>
+                                <button class="cancel" on:click=move |_| on_cancel.run(id)>"Cancel"</button>
+                            </Show>
+                        </span>
                     </div>
                     <div class="bar"><i style=bar_style></i></div>
                 </li>
@@ -253,7 +283,7 @@ pub fn JoinBox(on_join: Callback<String>) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_size;
+    use super::{fmt_size, fmt_speed, Status};
 
     #[test]
     fn formats_human_sizes() {
@@ -263,5 +293,27 @@ mod tests {
         assert_eq!(fmt_size(1536.0), "1.5 KB");
         assert_eq!(fmt_size(1_048_576.0), "1.0 MB");
         assert_eq!(fmt_size(1_073_741_824.0), "1.0 GB");
+    }
+
+    #[test]
+    fn speed_appends_per_second_suffix() {
+        assert_eq!(fmt_speed(0.0), "0 B/s");
+        assert_eq!(fmt_speed(1536.0), "1.5 KB/s");
+        assert_eq!(fmt_speed(1_048_576.0), "1.0 MB/s");
+    }
+
+    #[test]
+    fn status_labels_cover_every_variant() {
+        assert_eq!(Status::Idle.label(), "Idle");
+        assert_eq!(Status::WaitingForPeer.label(), "Waiting for peer to join…");
+        assert_eq!(Status::Connecting.label(), "Connecting…");
+        assert_eq!(Status::Connected.label(), "Connected — ready to transfer");
+        assert_eq!(Status::PeerLeft.label(), "Peer disconnected");
+        assert_eq!(Status::RoomFull.label(), "Room is full");
+        assert_eq!(Status::RoomNotFound.label(), "Room not found or expired");
+        assert_eq!(
+            Status::Error("boom".into()).label(),
+            "Couldn't establish direct connection: boom"
+        );
     }
 }

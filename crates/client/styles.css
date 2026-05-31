@@ -253,3 +253,12 @@ button, input { -webkit-tap-highlight-color: transparent; }
   font-family: "Space Mono", monospace; font-size: 11px; opacity: 0.7;
 }
 .row.declined { opacity: 0.6; }
+
+/* Active-row trailing cluster: live speed, percent, and the cancel button. */
+.row .meta { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.row .speed { font-family: "Space Mono", monospace; font-size: 11px; opacity: 0.7; }
+.row .cancel {
+  border: 2px solid var(--ink); background: var(--white); color: var(--ink);
+  font-family: "Space Grotesk", sans-serif; font-weight: 700; font-size: 11px;
+  text-transform: uppercase; padding: 4px 10px; cursor: pointer;
+}

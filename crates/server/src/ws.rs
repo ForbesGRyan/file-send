@@ -187,7 +187,20 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
 
 #[cfg(test)]
 mod tests {
-    use super::{gen_room_id, ROOM_ALPHABET};
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+    }
+
+    /// Register an outbound channel for `peer` and return its receiver so tests
+    /// can observe what `handle_message` pushes to that peer.
+    fn register(state: &AppState, peer: PeerId) -> mpsc::UnboundedReceiver<SignalMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.senders.lock().unwrap().insert(peer, tx);
+        rx
+    }
 
     #[test]
     fn room_id_is_six_chars_from_alphabet() {
@@ -199,5 +212,82 @@ mod tests {
                 "id {id:?} contains a char outside the alphabet"
             );
         }
+    }
+
+    #[test]
+    fn create_emits_created_with_room_code() {
+        let state = AppState::new();
+        let mut rx = register(&state, 1);
+        handle_message(&state, 1, ip(1), SignalMsg::Create);
+        match rx.try_recv().unwrap() {
+            SignalMsg::Created { room } => assert_eq!(room.chars().count(), 6),
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_notifies_initiator_then_relays_sdp_and_ice() {
+        let state = AppState::new();
+        let mut rx1 = register(&state, 1);
+        handle_message(&state, 1, ip(1), SignalMsg::Create);
+        let room = match rx1.try_recv().unwrap() {
+            SignalMsg::Created { room } => room,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let mut rx2 = register(&state, 2);
+        handle_message(&state, 2, ip(2), SignalMsg::Join { room });
+        // The initiator (peer 1) is told to start the offer.
+        assert!(matches!(rx1.try_recv().unwrap(), SignalMsg::PeerJoined));
+
+        // SDP and ICE relay verbatim to the partner.
+        handle_message(&state, 1, ip(1), SignalMsg::Sdp { sdp: "x".into(), kind: "offer".into() });
+        assert!(matches!(rx2.try_recv().unwrap(), SignalMsg::Sdp { .. }));
+        handle_message(&state, 2, ip(2), SignalMsg::Ice { candidate: "c".into() });
+        assert!(matches!(rx1.try_recv().unwrap(), SignalMsg::Ice { .. }));
+    }
+
+    #[test]
+    fn join_unknown_room_reports_not_found() {
+        let state = AppState::new();
+        let mut rx = register(&state, 1);
+        handle_message(&state, 1, ip(1), SignalMsg::Join { room: "zzzzzz".into() });
+        assert!(matches!(rx.try_recv().unwrap(), SignalMsg::RoomNotFound));
+    }
+
+    #[test]
+    fn third_peer_gets_room_full() {
+        let state = AppState::new();
+        let mut rx1 = register(&state, 1);
+        handle_message(&state, 1, ip(1), SignalMsg::Create);
+        let room = match rx1.try_recv().unwrap() {
+            SignalMsg::Created { room } => room,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        register(&state, 2);
+        handle_message(&state, 2, ip(2), SignalMsg::Join { room: room.clone() });
+
+        let mut rx3 = register(&state, 3);
+        handle_message(&state, 3, ip(3), SignalMsg::Join { room });
+        assert!(matches!(rx3.try_recv().unwrap(), SignalMsg::RoomFull));
+    }
+
+    #[test]
+    fn repeated_failed_joins_from_one_ip_get_rate_limited() {
+        let state = AppState::new();
+        let mut rx = register(&state, 1);
+        // Exhaust the failure budget, then one more trips the limiter branch.
+        for _ in 0..=JOIN_MAX_FAILURES {
+            handle_message(&state, 1, ip(7), SignalMsg::Join { room: "nope12".into() });
+            assert!(matches!(rx.try_recv().unwrap(), SignalMsg::RoomNotFound));
+        }
+    }
+
+    #[test]
+    fn server_originated_messages_are_ignored() {
+        let state = AppState::new();
+        let mut rx = register(&state, 1);
+        handle_message(&state, 1, ip(1), SignalMsg::PeerLeft);
+        assert!(rx.try_recv().is_err());
     }
 }

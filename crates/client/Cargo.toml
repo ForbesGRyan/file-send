@@ -29,6 +29,7 @@ features = [
   "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
   "RtcIceCandidate", "RtcIceCandidateInit",
   "Navigator", "Clipboard",
+  "Performance",
 ]
 
 [dev-dependencies]

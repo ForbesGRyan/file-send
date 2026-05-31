@@ -7,12 +7,12 @@ use shared::SignalMsg;
 use wasm_bindgen::JsCast;
 use web_sys::{DragEvent, HtmlInputElement, RtcPeerConnection, RtcSdpType};
 
-use crate::filetype::file_kind;
 use crate::protocol::FileStart;
 use crate::qr::qr_svg;
+use crate::rows;
 use crate::signaling::Signaling;
 use crate::transfer::{Handlers, Transfer};
-use crate::ui::{JoinBox, ProgressList, ShareLink, Status, StatusBar, Transfer as Row, TransferState};
+use crate::ui::{JoinBox, ProgressList, ShareLink, Status, StatusBar, Transfer as Row};
 use crate::webrtc;
 
 #[cfg(test)]
@@ -121,105 +121,28 @@ pub fn App() -> impl IntoView {
     // Files chosen before the channel is open; their offers are sent on open.
     let pending: Rc<RefCell<Vec<web_sys::File>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // Find-or-insert a transfer row keyed by (id, incoming), then mutate it.
-    let upsert_row = move |id: u64,
-                           incoming: bool,
-                           make: &dyn Fn() -> Row,
-                           apply: &dyn Fn(&mut Row)| {
-        set_items.update(|list| {
-            if let Some(row) = list.iter_mut().find(|r| r.id == id && r.incoming == incoming) {
-                apply(row);
-            } else {
-                let mut row = make();
-                apply(&mut row);
-                list.push(row);
-            }
-        });
-    };
-
-    // Build the transfer event handlers (UI updates).
-    let handlers = {
-        let make_incoming = move |meta: &FileStart| Row {
-            id: meta.id,
-            name: meta.name.clone(),
-            size: meta.size,
-            kind: file_kind(&meta.name, &meta.mime),
-            incoming: true,
-            fraction: 0.0,
-            state: TransferState::Offered,
-        };
-        Handlers {
-            on_offer: Rc::new(move |meta: FileStart| {
-                upsert_row(meta.id, true, &|| make_incoming(&meta), &|_r| {});
-            }),
-            on_recv_progress: Rc::new(move |id, name, recv, total| {
-                let frac = if total > 0.0 { recv / total } else { 1.0 };
-                upsert_row(
-                    id,
-                    true,
-                    &|| Row {
-                        id,
-                        name: name.clone(),
-                        size: total,
-                        kind: file_kind(&name, ""),
-                        incoming: true,
-                        fraction: frac,
-                        state: TransferState::Active,
-                    },
-                    &|r| {
-                        r.fraction = frac;
-                        r.state = TransferState::Active;
-                    },
-                );
-            }),
-            on_recv_complete: Rc::new(move |id, name| {
-                upsert_row(
-                    id,
-                    true,
-                    &|| Row {
-                        id,
-                        name: name.clone(),
-                        size: 0.0,
-                        kind: file_kind(&name, ""),
-                        incoming: true,
-                        fraction: 1.0,
-                        state: TransferState::Done,
-                    },
-                    &|r| {
-                        r.fraction = 1.0;
-                        r.state = TransferState::Done;
-                    },
-                );
-            }),
-            on_send_progress: Rc::new(move |id, name, sent, total| {
-                let frac = if total > 0.0 { sent / total } else { 1.0 };
-                let done = frac >= 1.0;
-                upsert_row(
-                    id,
-                    false,
-                    &|| Row {
-                        id,
-                        name: name.clone(),
-                        size: total,
-                        kind: file_kind(&name, ""),
-                        incoming: false,
-                        fraction: frac,
-                        state: if done { TransferState::Done } else { TransferState::Active },
-                    },
-                    &|r| {
-                        r.fraction = frac;
-                        r.state = if done { TransferState::Done } else { TransferState::Active };
-                    },
-                );
-            }),
-            on_rejected: Rc::new(move |id| {
-                set_items.update(|list| {
-                    if let Some(r) = list.iter_mut().find(|r| r.id == id && !r.incoming) {
-                        r.state = TransferState::Declined;
-                    }
-                });
-            }),
-        }
+    // Build the transfer event handlers. Each is a thin wrapper that applies a
+    // pure `rows` transition inside `set_items.update`; the logic itself lives
+    // in the `rows` module so it can be tested without a browser runtime.
+    let handlers = Handlers {
+        on_offer: Rc::new(move |meta: FileStart| {
+            set_items.update(|list| rows::incoming_offer(list, &meta));
+        }),
+        on_recv_progress: Rc::new(move |id, name, recv, total, speed| {
+            set_items.update(|list| rows::recv_progress(list, id, &name, recv, total, speed));
+        }),
+        on_recv_complete: Rc::new(move |id, name| {
+            set_items.update(|list| rows::recv_complete(list, id, &name));
+        }),
+        on_send_progress: Rc::new(move |id, name, sent, total| {
+            set_items.update(|list| rows::send_progress(list, id, &name, sent, total));
+        }),
+        on_rejected: Rc::new(move |id| {
+            set_items.update(|list| rows::mark_rejected(list, id));
+        }),
+        on_cancelled: Rc::new(move |id| {
+            set_items.update(|list| rows::mark_cancelled_remote(list, id));
+        }),
     };
 
     // Offer a batch of files now and add their outgoing rows.
@@ -232,29 +155,19 @@ pub fn App() -> impl IntoView {
                 .map(|t| t.offer_files(files))
                 .unwrap_or_default();
             for (id, name, size) in offered {
-                set_items.update(|list| {
-                    list.push(Row {
-                        id,
-                        name: name.clone(),
-                        size,
-                        kind: file_kind(&name, ""),
-                        incoming: false,
-                        fraction: 0.0,
-                        state: TransferState::Offered,
-                    });
-                });
+                set_items.update(|list| rows::push_outgoing_offer(list, id, &name, size));
             }
         })
     };
 
-    // Wire a freshly-available data channel: build the Transfer + flush queue on open.
-    let wire_dc = {
+    // Wire the control channel: build the Transfer + flush the queue on open.
+    let wire_ctrl: Rc<dyn Fn(RtcPeerConnection, web_sys::RtcDataChannel)> = {
         let transfer = transfer.clone();
         let pending = pending.clone();
         let offer_now = offer_now.clone();
         let handlers = handlers.clone();
-        Rc::new(move |channel: web_sys::RtcDataChannel| {
-            let t = Transfer::new(channel, handlers.clone());
+        Rc::new(move |peer: RtcPeerConnection, channel: web_sys::RtcDataChannel| {
+            let t = Transfer::new(peer, channel, handlers.clone());
             // On open: mark connected and offer any files queued before connect.
             let pending = pending.clone();
             let offer_now = offer_now.clone();
@@ -274,7 +187,8 @@ pub fn App() -> impl IntoView {
     {
         let pc = pc.clone();
         let sig = sig.clone();
-        let wire_dc = wire_dc.clone();
+        let wire_ctrl = wire_ctrl.clone();
+        let transfer = transfer.clone();
         Effect::new(move |_| {
             let is_joiner = room_from_hash().is_some();
             set_status.set(Status::Connecting);
@@ -288,14 +202,26 @@ pub fn App() -> impl IntoView {
             };
             *pc.borrow_mut() = Some(peer.clone());
 
-            // Joiner waits for the initiator-created channel.
-            if is_joiner {
-                let wire = wire_dc.clone();
-                webrtc::on_data_channel(&peer, move |ch| wire(ch));
-            } else {
-                // Initiator creates the channel up front.
-                let channel = webrtc::create_data_channel(&peer);
-                wire_dc(channel);
+            // Both peers listen for inbound channels: the control channel (joiner
+            // side) and per-file channels (whichever side is receiving a file).
+            // Channels are routed by label — `CTRL_LABEL` vs a numeric file id.
+            {
+                let wire = wire_ctrl.clone();
+                let transfer = transfer.clone();
+                let peer_for_dc = peer.clone();
+                webrtc::on_data_channel(&peer, move |ch| {
+                    if ch.label() == crate::transfer::CTRL_LABEL {
+                        wire(peer_for_dc.clone(), ch);
+                    } else if let Some(t) = transfer.borrow().as_ref() {
+                        t.handle_incoming_channel(ch);
+                    }
+                });
+            }
+            // Initiator creates the control channel up front; the joiner receives
+            // it via `ondatachannel` above.
+            if !is_joiner {
+                let channel = webrtc::create_data_channel(&peer, crate::transfer::CTRL_LABEL);
+                wire_ctrl(peer.clone(), channel);
             }
 
             // Build signaling; route inbound messages.
@@ -402,11 +328,7 @@ pub fn App() -> impl IntoView {
             }
             // Optimistically leave the Offered state so the buttons hide and a
             // second click can't re-accept; real progress updates follow.
-            set_items.update(|list| {
-                if let Some(r) = list.iter_mut().find(|r| r.id == id && r.incoming) {
-                    r.state = TransferState::Active;
-                }
-            });
+            set_items.update(|list| rows::accept(list, id));
         }
     };
     let on_decline = {
@@ -416,30 +338,29 @@ pub fn App() -> impl IntoView {
                 t.reject(id);
             }
             // Remove the declined incoming row locally.
-            set_items.update(|list| list.retain(|r| !(r.id == id && r.incoming)));
+            set_items.update(|list| rows::decline(list, id));
+        }
+    };
+    // Cancel an in-progress incoming download: stop the sender, mark the row.
+    let on_cancel = {
+        let transfer = transfer.clone();
+        move |id: u64| {
+            if let Some(t) = transfer.borrow().as_ref() {
+                t.cancel(id);
+            }
+            set_items.update(|list| rows::cancel(list, id));
         }
     };
     let on_accept_all = {
         let transfer = transfer.clone();
         move || {
-            let ids: Vec<u64> = items
-                .get_untracked()
-                .iter()
-                .filter(|r| r.incoming && r.state == TransferState::Offered)
-                .map(|r| r.id)
-                .collect();
+            let ids = rows::pending_incoming_ids(&items.get_untracked());
             if let Some(t) = transfer.borrow().as_ref() {
                 for id in &ids {
                     t.accept(*id);
                 }
             }
-            set_items.update(|list| {
-                for r in list.iter_mut() {
-                    if r.incoming && ids.contains(&r.id) {
-                        r.state = TransferState::Active;
-                    }
-                }
-            });
+            set_items.update(|list| rows::accept_all(list, &ids));
         }
     };
 
@@ -523,6 +444,7 @@ pub fn App() -> impl IntoView {
                 items=items
                 on_accept=UnsyncCallback::new(on_accept)
                 on_decline=UnsyncCallback::new(on_decline)
+                on_cancel=UnsyncCallback::new(on_cancel)
                 on_accept_all=UnsyncCallback::new(move |_| on_accept_all())
             />
         </main>

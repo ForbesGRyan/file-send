@@ -37,6 +37,8 @@ pub enum Control {
     Start(FileStart),
     /// Byte stream for a file is complete.
     End(FileEnd),
+    /// Receiver aborts an in-progress file `id`; the sender stops streaming it.
+    Cancel { id: u64 },
 }
 
 /// Encode a control frame to a JSON string (sent as a text data-channel message).
@@ -119,6 +121,12 @@ mod tests {
         let r = Control::Reject { id: 6 };
         assert_eq!(decode_control(&encode_control(&a)), Some(a));
         assert_eq!(decode_control(&encode_control(&r)), Some(r));
+    }
+
+    #[test]
+    fn control_roundtrip_cancel() {
+        let c = Control::Cancel { id: 8 };
+        assert_eq!(decode_control(&encode_control(&c)), Some(c));
     }
 
     #[test]

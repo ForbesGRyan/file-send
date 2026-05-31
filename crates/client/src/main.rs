@@ -2,6 +2,7 @@ mod app;
 mod filetype;
 mod protocol;
 mod qr;
+mod rows;
 mod signaling;
 mod transfer;
 mod ui;
