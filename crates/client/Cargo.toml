@@ -23,7 +23,7 @@ features = [
   "WebSocket", "BinaryType",
   "File", "FileList", "Blob", "BlobPropertyBag", "Url",
   "RtcPeerConnection", "RtcConfiguration", "RtcIceServer",
-  "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelState",
+  "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelState", "RtcDataChannelType",
   "RtcDataChannelEvent", "RtcPeerConnectionIceEvent",
   "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
   "RtcIceCandidate", "RtcIceCandidateInit",
