@@ -1,21 +1,36 @@
 //! WebSocket signaling: one connection per peer, relays messages to partner.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     response::Response,
 };
 use shared::SignalMsg;
 use tokio::sync::mpsc;
 
+use crate::limiter::JoinLimiter;
 use crate::rooms::{JoinOutcome, PeerId, RoomRegistry};
+
+/// Sliding window for the per-IP join-attempt rate limit.
+const JOIN_WINDOW_MS: u64 = 60_000;
+/// Max failed join attempts per IP within `JOIN_WINDOW_MS`. Generous for humans
+/// (who typically attempt once) but throttles online enumeration of room codes
+/// to a rate that makes brute force infeasible.
+const JOIN_MAX_FAILURES: usize = 30;
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 /// Shared application state, cloned cheaply (Arc) into every handler.
 #[derive(Clone)]
@@ -24,6 +39,8 @@ pub struct AppState {
     /// Per-peer outbound channel senders, so a peer can push to its partner.
     senders: Arc<Mutex<std::collections::HashMap<PeerId, mpsc::UnboundedSender<SignalMsg>>>>,
     next_id: Arc<AtomicU64>,
+    /// Per-IP rate limiter for room-join attempts.
+    join_limiter: Arc<Mutex<JoinLimiter>>,
 }
 
 impl AppState {
@@ -32,6 +49,7 @@ impl AppState {
             registry: Arc::new(Mutex::new(RoomRegistry::new())),
             senders: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            join_limiter: Arc::new(Mutex::new(JoinLimiter::new(JOIN_WINDOW_MS, JOIN_MAX_FAILURES))),
         }
     }
 
@@ -50,11 +68,16 @@ impl Default for AppState {
 }
 
 /// Axum handler for `GET /ws`: upgrades to a WebSocket.
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    let ip = addr.ip();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, ip))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
     use futures_util::{SinkExt, StreamExt};
 
     let peer_id = state.next_id.fetch_add(1, Ordering::Relaxed);
@@ -80,7 +103,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Ok(parsed) = serde_json::from_str::<SignalMsg>(&text) else {
                     continue;
                 };
-                handle_message(&recv_state, peer_id, parsed);
+                handle_message(&recv_state, peer_id, ip, parsed);
             } else if let Message::Close(_) = msg {
                 break;
             }
@@ -112,8 +135,9 @@ fn gen_room_id() -> String {
     nanoid::nanoid!(6, &ROOM_ALPHABET)
 }
 
-/// Apply one inbound signaling message.
-fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
+/// Apply one inbound signaling message. `ip` is the peer's source address, used
+/// to rate-limit join attempts.
+fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
     match msg {
         SignalMsg::Create => {
             let room_id = gen_room_id();
@@ -123,6 +147,13 @@ fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
             }
         }
         SignalMsg::Join { room } => {
+            let now = now_ms();
+            // Throttle enumeration: an IP over its recent failed-attempt budget
+            // is told the room doesn't exist, without touching the registry.
+            if !state.join_limiter.lock().unwrap().allowed(ip, now) {
+                state.send_to(peer, SignalMsg::RoomNotFound);
+                return;
+            }
             let outcome = state.registry.lock().unwrap().join(peer, &room);
             match outcome {
                 JoinOutcome::Joined => {
@@ -131,8 +162,14 @@ fn handle_message(state: &AppState, peer: PeerId, msg: SignalMsg) {
                         state.send_to(partner, SignalMsg::PeerJoined);
                     }
                 }
-                JoinOutcome::Full => state.send_to(peer, SignalMsg::RoomFull),
-                JoinOutcome::NotFound => state.send_to(peer, SignalMsg::RoomNotFound),
+                JoinOutcome::Full => {
+                    state.join_limiter.lock().unwrap().record_failure(ip, now);
+                    state.send_to(peer, SignalMsg::RoomFull);
+                }
+                JoinOutcome::NotFound => {
+                    state.join_limiter.lock().unwrap().record_failure(ip, now);
+                    state.send_to(peer, SignalMsg::RoomNotFound);
+                }
                 JoinOutcome::Created(_) => {}
             }
         }

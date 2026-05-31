@@ -42,6 +42,15 @@ cargo run --release -p server     # serves crates/client/dist on :3000
   runtime origin (`window.location.origin`); set this only when the public URL
   differs from what the browser sees (e.g. behind a reverse proxy).
 
+## Room codes & rate limiting
+Room codes are 6 lowercase, unambiguous characters (`a–z` + `2–9`, no
+`i/l/o/0/1`) — easy to read and type. To keep the short codes from being
+enumerable, the server rate-limits failed join attempts per source IP (30 per
+60s); a peer over the limit is told the room doesn't exist. Behind a reverse
+proxy the limit keys on the proxy's address (the `X-Forwarded-For` header is
+not trusted), so per-IP limiting is most effective on a directly-exposed
+server.
+
 ## Known limitation
 True P2P with no TURN relay. Peers behind symmetric NAT may fail to connect
 directly; the UI surfaces a clear error. A TURN fallback is a future
