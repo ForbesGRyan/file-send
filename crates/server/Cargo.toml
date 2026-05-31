@@ -1,0 +1,25 @@
+[package]
+name = "server"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+nanoid = "0.4"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"

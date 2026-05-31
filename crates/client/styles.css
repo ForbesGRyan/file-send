@@ -1,0 +1,130 @@
+:root {
+  --paper: #f2f0e9;
+  --ink: #0a0a0a;
+  --orange: #ff4d2e;
+  --white: #ffffff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  /* subtle grain */
+  background-image: radial-gradient(var(--ink) 0.5px, transparent 0.5px);
+  background-size: 4px 4px;
+  background-blend-mode: multiply;
+}
+
+.container {
+  max-width: 720px;
+  margin: 40px auto;
+  padding: 30px;
+  background: var(--paper);
+  border: 3px solid var(--ink);
+  position: relative;
+}
+
+/* Wordmark */
+.wm {
+  font-family: "Archivo Black", sans-serif;
+  font-size: clamp(44px, 12vw, 64px);
+  line-height: 0.82;
+  text-transform: uppercase;
+  letter-spacing: -3px;
+  margin: 0;
+}
+.wm span { color: var(--orange); }
+.tagline {
+  font-family: "Space Mono", monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin: 10px 0 0;
+  border-left: 3px solid var(--orange);
+  padding-left: 8px;
+}
+
+/* Status */
+.statusrow { display: flex; align-items: center; gap: 10px; margin: 24px 0; }
+.dot { width: 14px; height: 14px; background: var(--orange); border: 2px solid var(--ink); flex-shrink: 0; }
+.status { font-weight: 700; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* Generic block */
+.block {
+  border: 3px solid var(--ink);
+  background: var(--white);
+  padding: 16px;
+  margin-bottom: 18px;
+  box-shadow: 6px 6px 0 var(--ink);
+}
+.label {
+  font-family: "Space Mono", monospace;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  margin: 0 0 10px;
+}
+
+/* Share block */
+.share { display: flex; gap: 16px; align-items: flex-start; }
+.share .left { flex: 1; min-width: 0; }
+.linkrow { display: flex; border: 3px solid var(--ink); }
+.linkrow input {
+  flex: 1; min-width: 0; border: 0; padding: 10px;
+  font-family: "Space Mono", monospace; font-size: 12px;
+  background: var(--paper); color: var(--ink);
+}
+.copybtn {
+  border: 0; border-left: 3px solid var(--ink);
+  background: var(--orange); color: var(--ink);
+  font-family: "Archivo Black", sans-serif; font-size: 12px;
+  padding: 0 16px; text-transform: uppercase; cursor: pointer;
+}
+.copybtn:active { background: var(--ink); color: var(--paper); }
+.note { font-family: "Space Mono", monospace; font-size: 10px; margin: 8px 0 0; }
+.qrwrap { flex-shrink: 0; }
+.qr { width: 104px; height: 104px; border: 3px solid var(--ink); background: var(--white); }
+.qr svg { display: block; width: 100%; height: 100%; }
+.qr-cap {
+  font-family: "Space Mono", monospace; font-size: 9px;
+  text-align: center; margin: 6px 0 0; text-transform: uppercase;
+}
+
+/* Drop zone */
+.drop {
+  border: 3px dashed var(--ink);
+  background: repeating-linear-gradient(45deg, transparent, transparent 12px,
+    rgba(255, 77, 46, 0.06) 12px, rgba(255, 77, 46, 0.06) 24px);
+  padding: 34px 18px; text-align: center; margin-bottom: 18px;
+  transition: background 0.1s, transform 0.1s;
+}
+.drop.active { background: var(--orange); border-style: solid; transform: translate(-2px, -2px); }
+.drop b {
+  font-family: "Archivo Black", sans-serif; font-size: 18px;
+  text-transform: uppercase; display: block; letter-spacing: -0.5px;
+}
+.drop .sub { font-family: "Space Mono", monospace; font-size: 11px; display: block; margin-top: 6px; }
+.drop input[type="file"] { margin-top: 14px; font-family: "Space Mono", monospace; font-size: 11px; }
+
+/* Transfer rows */
+.progress-list { list-style: none; padding: 0; margin: 0; }
+.row {
+  border: 3px solid var(--ink); background: var(--white);
+  padding: 12px 14px; margin-bottom: 10px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.row.done { background: var(--ink); color: var(--paper); }
+.row .top { display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 13px; gap: 10px; }
+.row .name { font-family: "Space Mono", monospace; }
+.diricon { color: var(--orange); }
+.row.done .diricon { color: var(--paper); }
+.tag {
+  font-family: "Space Mono", monospace; font-size: 9px;
+  border: 2px solid currentColor; padding: 1px 5px; text-transform: uppercase;
+}
+.pct { font-family: "Archivo Black", sans-serif; font-size: 14px; white-space: nowrap; }
+.bar { height: 14px; background: var(--paper); border: 2px solid var(--ink); }
+.bar i { display: block; height: 100%; background: var(--orange); }
+.row.done .bar { background: #333333; border-color: var(--paper); }
+.row.done .bar i { background: var(--paper); }

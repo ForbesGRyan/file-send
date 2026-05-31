@@ -1,0 +1,9 @@
+[build]
+target = "index.html"
+
+[serve]
+port = 8080
+
+[[proxy]]
+backend = "http://127.0.0.1:3000/ws"
+ws = true
