@@ -7,9 +7,11 @@ use shared::SignalMsg;
 use wasm_bindgen::JsCast;
 use web_sys::{DragEvent, HtmlInputElement, RtcDataChannel, RtcPeerConnection, RtcSdpType};
 
+use crate::filetype::file_kind;
+use crate::qr::qr_svg;
 use crate::signaling::Signaling;
 use crate::transfer::{attach_receiver, send_files};
-use crate::ui::{FileProgress, ProgressList, Status, StatusBar};
+use crate::ui::{FileProgress, ProgressList, ShareLink, Status, StatusBar};
 use crate::webrtc;
 
 /// Read the room id from the URL hash (`#/room/<id>`), if present.
@@ -25,6 +27,8 @@ pub fn App() -> impl IntoView {
     let (status, set_status) = signal(Status::Idle);
     let (room_link, set_room_link) = signal(String::new());
     let (progress, set_progress) = signal(Vec::<FileProgress>::new());
+    let (qr, set_qr) = signal(String::new());
+    let (drag_active, set_drag_active) = signal(false);
 
     // Shared handles populated as the connection is established.
     let pc: Rc<RefCell<Option<RtcPeerConnection>>> = Rc::new(RefCell::new(None));
@@ -33,11 +37,16 @@ pub fn App() -> impl IntoView {
 
     // Helper to update one file's progress row.
     let upsert_progress = move |name: String, fraction: f64, direction: &'static str| {
+        let kind = file_kind(&name, "");
+        let done = fraction >= 1.0;
         set_progress.update(|list| {
-            if let Some(item) = list.iter_mut().find(|p| p.name == name && p.direction == direction) {
+            if let Some(item) =
+                list.iter_mut().find(|p| p.name == name && p.direction == direction)
+            {
                 item.fraction = fraction;
+                item.done = done;
             } else {
-                list.push(FileProgress { name, fraction, direction });
+                list.push(FileProgress { name, fraction, direction, kind, done });
             }
         });
     };
@@ -51,9 +60,12 @@ pub fn App() -> impl IntoView {
                 &channel,
                 move |name, recv, total| {
                     let frac = if total > 0.0 { recv / total } else { 1.0 };
-                    up(name, frac, "↓ receiving");
+                    up(name, frac, "↓");
                 },
-                |_name| {},
+                move |name| {
+                    // Authoritative per-file completion on the receive side.
+                    up(name, 1.0, "↓");
+                },
             );
             let set_status = set_status;
             let onopen = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
@@ -104,7 +116,9 @@ pub fn App() -> impl IntoView {
                 match msg {
                     SignalMsg::Created { room } => {
                         let origin = web_sys::window().unwrap().location().origin().unwrap();
-                        set_room_link.set(format!("{origin}/#/room/{room}"));
+                        let link = format!("{origin}/#/room/{room}");
+                        set_qr.set(qr_svg(&link));
+                        set_room_link.set(link);
                         set_status.set(Status::WaitingForPeer);
                     }
                     SignalMsg::PeerJoined => {
@@ -184,7 +198,7 @@ pub fn App() -> impl IntoView {
                     files,
                     move |name, sent, total| {
                         let frac = if total > 0.0 { sent / total } else { 1.0 };
-                        up(name, frac, "↑ sending");
+                        up(name, frac, "↑");
                     },
                     || {},
                 );
@@ -196,6 +210,7 @@ pub fn App() -> impl IntoView {
         let on_files = on_files.clone();
         move |ev: DragEvent| {
             ev.prevent_default();
+            set_drag_active.set(false);
             let mut files = Vec::new();
             if let Some(dt) = ev.data_transfer() {
                 if let Some(list) = dt.files() {
@@ -226,28 +241,28 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    let drop_class = move || if drag_active.get() { "drop active" } else { "drop" };
+
     view! {
         <main class="container">
-            <h1>"file-send"</h1>
+            <h1 class="wm">"File"<span>"·"</span><br/>"Send"</h1>
+            <p class="tagline">"Peer-to-peer // bytes never touch a server"</p>
+
             <StatusBar status/>
 
             <Show when=move || !room_link.get().is_empty()>
-                <div class="room-link">
-                    <p>"Share this link with the other person:"</p>
-                    <input
-                        type="text"
-                        readonly
-                        prop:value=move || room_link.get()
-                    />
-                </div>
+                <ShareLink link=room_link qr=qr/>
             </Show>
 
             <div
-                class="drop-zone"
-                on:dragover=|ev: DragEvent| ev.prevent_default()
+                class=drop_class
+                on:dragenter=move |ev: DragEvent| { ev.prevent_default(); set_drag_active.set(true); }
+                on:dragover=move |ev: DragEvent| ev.prevent_default()
+                on:dragleave=move |_| set_drag_active.set(false)
                 on:drop=on_drop
             >
-                <p>"Drag & drop files here, or choose:"</p>
+                <b>"Drop files here"</b>
+                <span class="sub">"— or click to choose —"</span>
                 <input type="file" multiple on:change=on_input_change />
             </div>
 

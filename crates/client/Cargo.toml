@@ -28,6 +28,7 @@ features = [
   "RtcDataChannelEvent", "RtcPeerConnectionIceEvent",
   "RtcSessionDescription", "RtcSessionDescriptionInit", "RtcSdpType",
   "RtcIceCandidate", "RtcIceCandidateInit",
+  "Navigator", "Clipboard",
 ]
 
 [dev-dependencies]

@@ -35,13 +35,18 @@ impl Status {
 pub struct FileProgress {
     pub name: String,
     pub fraction: f64,
-    pub direction: &'static str, // "↑ sending" / "↓ receiving"
+    pub direction: &'static str, // "↑" sending / "↓" receiving
+    pub kind: &'static str,      // type badge, e.g. "PDF", "IMG"
+    pub done: bool,
 }
 
 #[component]
 pub fn StatusBar(status: ReadSignal<Status>) -> impl IntoView {
     view! {
-        <p class="status">{move || status.get().label()}</p>
+        <div class="statusrow">
+            <span class="dot"></span>
+            <span class="status">{move || status.get().label()}</span>
+        </div>
     }
 }
 
@@ -55,16 +60,63 @@ pub fn ProgressList(items: ReadSignal<Vec<FileProgress>>) -> impl IntoView {
                     .into_iter()
                     .map(|p| {
                         let pct = (p.fraction * 100.0).round();
+                        let row_class = if p.done { "row done" } else { "row" };
+                        let pct_label = if p.done {
+                            "✓ DONE".to_string()
+                        } else {
+                            format!("{pct}%")
+                        };
+                        let bar_style = format!("width:{pct}%");
                         view! {
-                            <li>
-                                <span>{p.direction}" "{p.name.clone()}</span>
-                                <progress max="100" value=pct></progress>
-                                <span>{pct}"%"</span>
+                            <li class=row_class>
+                                <div class="top">
+                                    <span>
+                                        <span class="diricon">{p.direction}</span>
+                                        " "
+                                        <span class="name">{p.name.clone()}</span>
+                                        " "
+                                        <span class="tag">{p.kind}</span>
+                                    </span>
+                                    <span class="pct">{pct_label}</span>
+                                </div>
+                                <div class="bar"><i style=bar_style></i></div>
                             </li>
                         }
                     })
                     .collect_view()
             }}
         </ul>
+    }
+}
+
+/// Share block: readonly room link with a copy button, plus a QR code
+/// (an SVG string injected as inner HTML) for phone scanning.
+#[component]
+pub fn ShareLink(
+    link: ReadSignal<String>,
+    qr: ReadSignal<String>,
+) -> impl IntoView {
+    let copy = move |_| {
+        let text = link.get_untracked();
+        if let Some(win) = web_sys::window() {
+            // Fire-and-forget; the returned Promise is intentionally ignored.
+            let _ = win.navigator().clipboard().write_text(&text);
+        }
+    };
+    view! {
+        <div class="block share">
+            <div class="left">
+                <p class="label">"Share to connect a peer"</p>
+                <div class="linkrow">
+                    <input type="text" readonly prop:value=move || link.get() />
+                    <button class="copybtn" on:click=copy>"Copy"</button>
+                </div>
+                <p class="note">"Link expires when you close the tab."</p>
+            </div>
+            <div class="qrwrap">
+                <div class="qr" inner_html=move || qr.get()></div>
+                <p class="qr-cap">"scan on phone"</p>
+            </div>
+        </div>
     }
 }
