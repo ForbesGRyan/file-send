@@ -146,7 +146,12 @@ fn trigger_download(blob: &Blob, filename: &str) {
     anchor.set_href(&url);
     anchor.set_download(filename);
     anchor.click();
-    let _ = Url::revoke_object_url(&url);
+    // Defer revocation by one event-loop tick so it can't race the browser's
+    // asynchronous download dispatch (a Safari edge case if revoked inline).
+    spawn_local(async move {
+        yield_to_event_loop().await;
+        let _ = Url::revoke_object_url(&url);
+    });
 }
 
 /// Drain a queue of files sequentially over the data channel.
