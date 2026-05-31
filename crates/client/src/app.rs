@@ -41,6 +41,28 @@ mod tests {
     fn blank_input_yields_empty() {
         assert_eq!(normalize_code("   "), "");
     }
+
+    use super::resolve_origin;
+
+    #[test]
+    fn resolve_origin_prefers_nonempty_override() {
+        assert_eq!(
+            resolve_origin(Some("https://files.example.com"), "http://localhost:3000"),
+            "https://files.example.com"
+        );
+        // Trailing slash is stripped so links don't double up.
+        assert_eq!(
+            resolve_origin(Some("https://files.example.com/"), "http://localhost:3000"),
+            "https://files.example.com"
+        );
+    }
+
+    #[test]
+    fn resolve_origin_falls_back_when_unset_or_blank() {
+        assert_eq!(resolve_origin(None, "http://localhost:3000"), "http://localhost:3000");
+        assert_eq!(resolve_origin(Some(""), "http://localhost:3000"), "http://localhost:3000");
+        assert_eq!(resolve_origin(Some("   "), "http://localhost:3000"), "http://localhost:3000");
+    }
 }
 
 /// Extract a bare room code from user input. Accepts either a raw code or a
@@ -52,6 +74,24 @@ fn normalize_code(raw: &str) -> String {
         Some(idx) => s[idx + "room/".len()..].trim_matches('/').trim().to_string(),
         None => s.to_string(),
     }
+}
+
+/// Choose the origin for share links: a non-empty compile-time override wins
+/// (trailing slash stripped), otherwise the browser's runtime origin.
+fn resolve_origin(compile_time: Option<&str>, runtime: &str) -> String {
+    match compile_time {
+        Some(o) if !o.trim().is_empty() => o.trim().trim_end_matches('/').to_string(),
+        _ => runtime.to_string(),
+    }
+}
+
+/// Origin used to build share links. Set `PUBLIC_ORIGIN` at build time to
+/// override the browser origin — useful behind a reverse proxy or when the
+/// public domain differs from what the browser sees. Otherwise the current
+/// `window.location.origin` is used.
+fn public_origin() -> String {
+    let runtime = web_sys::window().unwrap().location().origin().unwrap();
+    resolve_origin(option_env!("PUBLIC_ORIGIN"), &runtime)
 }
 
 /// Read the room id from the URL hash (`#/room/<id>`), if present.
@@ -156,8 +196,7 @@ pub fn App() -> impl IntoView {
                 let sig_for_cb = sig_for_cb.clone();
                 match msg {
                     SignalMsg::Created { room } => {
-                        let origin = web_sys::window().unwrap().location().origin().unwrap();
-                        let link = format!("{origin}/#/room/{room}");
+                        let link = format!("{}/#/room/{room}", public_origin());
                         set_qr.set(qr_svg(&link));
                         set_room_link.set(link);
                         set_room_code.set(room);
