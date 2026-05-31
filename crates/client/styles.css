@@ -16,7 +16,12 @@ body {
   background-image: radial-gradient(var(--ink) 0.5px, transparent 0.5px);
   background-size: 4px 4px;
   background-blend-mode: multiply;
+  /* offset shadows extend past blocks; never let them spawn a scroll axis */
+  overflow-x: hidden;
 }
+
+/* Replace the mobile grey tap-flash with our own :active styles below. */
+button, input { -webkit-tap-highlight-color: transparent; }
 
 .container {
   max-width: 720px;
@@ -181,3 +186,70 @@ body {
 .bar i { display: block; height: 100%; background: var(--orange); }
 .row.done .bar { background: #333333; border-color: var(--paper); }
 .row.done .bar i { background: var(--paper); }
+
+/* Long filenames must wrap inside the row, never shove the % off-screen. */
+.row .top > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.row .name { word-break: break-all; }
+
+/* ───────────────────────────────────────────────────────────
+   NARROW SCREENS — phones in portrait.
+   The brutalist look is preserved; only the geometry adapts:
+   blocks stack, the QR drops below the code, touch targets grow,
+   and inputs hit 16px so iOS Safari stops zooming on focus.
+   ─────────────────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  .container {
+    /* Edge-to-edge, respecting notch/rounded-corner safe areas. */
+    margin: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+            max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    padding: 18px 16px;
+  }
+
+  /* Trim the offset shadow so it doesn't crowd the narrow gutter. */
+  .block { box-shadow: 4px 4px 0 var(--ink); }
+
+  /* Share: QR stops fighting the code for width — it drops below, centered. */
+  .share { flex-direction: column; gap: 18px; }
+  .share .left { width: 100%; }
+  .qrwrap { align-self: center; text-align: center; }
+  .qr { width: 132px; height: 132px; }
+
+  /* Demoted link row: caption sits above its own full-width input + button. */
+  .sharelink { flex-wrap: wrap; }
+  .sharelink-cap { flex-basis: 100%; }
+
+  /* Comfortable touch targets (≥44px) on every control. */
+  .copybtn, .copycode, .joinbtn { min-height: 44px; }
+  .copybtn.small { min-height: 40px; }
+
+  /* 16px text in any focusable field disables iOS focus-zoom. */
+  .joininput,
+  .sharelink input { font-size: 16px; }
+  .joininput { padding: 12px 14px; }
+}
+
+/* The very narrow end (small/older phones). */
+@media (max-width: 360px) {
+  .container { margin: 8px; padding: 14px 12px; }
+  .wm { letter-spacing: -2px; }
+  .code { letter-spacing: 1px; }
+}
+
+/* Transfer offer / decline / actions */
+.acceptall {
+  border: 3px solid var(--ink); background: var(--orange); color: var(--ink);
+  font-family: "Archivo Black", sans-serif; font-size: 12px;
+  text-transform: uppercase; padding: 6px 14px; margin-bottom: 10px; cursor: pointer;
+}
+.row.offer .actions { display: flex; gap: 8px; }
+.row .accept, .row .decline {
+  border: 2px solid var(--ink); font-family: "Space Grotesk", sans-serif;
+  font-weight: 700; font-size: 11px; text-transform: uppercase; padding: 4px 10px; cursor: pointer;
+}
+.row .accept { background: var(--orange); color: var(--ink); }
+.row .decline { background: var(--white); color: var(--ink); }
+.row .size { font-family: "Space Mono", monospace; font-size: 10px; opacity: 0.7; }
+.row.waiting .pct, .row.declined .pct {
+  font-family: "Space Mono", monospace; font-size: 11px; opacity: 0.7;
+}
+.row.declined { opacity: 0.6; }

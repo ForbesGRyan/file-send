@@ -30,14 +30,45 @@ impl Status {
     }
 }
 
-/// One file's transfer progress (0.0..=1.0).
+/// Format a byte count as a short human string (e.g. "1.5 KB").
+pub fn fmt_size(bytes: f64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{} {}", v as u64, UNITS[u])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Lifecycle state of one transfer row.
 #[derive(Clone, PartialEq)]
-pub struct FileProgress {
+pub enum TransferState {
+    /// Incoming: awaiting the local user's accept/decline. Outgoing: awaiting the peer.
+    Offered,
+    /// Bytes are flowing.
+    Active,
+    /// Finished and saved (incoming) or fully sent (outgoing).
+    Done,
+    /// Declined by the deciding side.
+    Declined,
+}
+
+/// One transfer's UI row. Rows are keyed by `(id, incoming)`.
+#[derive(Clone, PartialEq)]
+pub struct Transfer {
+    pub id: u64,
     pub name: String,
-    pub fraction: f64,
-    pub direction: &'static str, // "↑" sending / "↓" receiving
-    pub kind: &'static str,      // type badge, e.g. "PDF", "IMG"
-    pub done: bool,
+    pub size: f64,
+    pub kind: &'static str, // type badge, e.g. "PDF"
+    pub incoming: bool,     // true = receiving (peer -> me); false = sending
+    pub fraction: f64,      // 0.0..=1.0
+    pub state: TransferState,
 }
 
 #[component]
@@ -51,41 +82,103 @@ pub fn StatusBar(status: ReadSignal<Status>) -> impl IntoView {
 }
 
 #[component]
-pub fn ProgressList(items: ReadSignal<Vec<FileProgress>>) -> impl IntoView {
+pub fn ProgressList(
+    items: ReadSignal<Vec<Transfer>>,
+    on_accept: UnsyncCallback<u64>,
+    on_decline: UnsyncCallback<u64>,
+    on_accept_all: UnsyncCallback<()>,
+) -> impl IntoView {
+    // Show "Accept all" only when 2+ incoming offers are pending.
+    let show_accept_all = move || {
+        items.get().iter().filter(|t| t.incoming && t.state == TransferState::Offered).count() >= 2
+    };
     view! {
+        <Show when=show_accept_all>
+            <button class="acceptall" on:click=move |_| on_accept_all.run(())>
+                "Accept all"
+            </button>
+        </Show>
         <ul class="progress-list">
             {move || {
                 items
                     .get()
                     .into_iter()
-                    .map(|p| {
-                        let pct = (p.fraction * 100.0).round();
-                        let row_class = if p.done { "row done" } else { "row" };
-                        let pct_label = if p.done {
-                            "✓ DONE".to_string()
-                        } else {
-                            format!("{pct}%")
-                        };
-                        let bar_style = format!("width:{pct}%");
-                        view! {
-                            <li class=row_class>
-                                <div class="top">
-                                    <span>
-                                        <span class="diricon">{p.direction}</span>
-                                        " "
-                                        <span class="name">{p.name.clone()}</span>
-                                        " "
-                                        <span class="tag">{p.kind}</span>
-                                    </span>
-                                    <span class="pct">{pct_label}</span>
-                                </div>
-                                <div class="bar"><i style=bar_style></i></div>
-                            </li>
-                        }
-                    })
+                    .map(|t| transfer_row(t, on_accept, on_decline))
                     .collect_view()
             }}
         </ul>
+    }
+}
+
+/// Render one transfer row according to its state.
+fn transfer_row(t: Transfer, on_accept: UnsyncCallback<u64>, on_decline: UnsyncCallback<u64>) -> impl IntoView {
+    let id = t.id;
+    let pct = (t.fraction * 100.0).round();
+    let arrow = if t.incoming { "↓" } else { "↑" };
+    match t.state {
+        TransferState::Offered if t.incoming => view! {
+            <li class="row offer">
+                <div class="top">
+                    <span>
+                        <span class="diricon">{arrow}</span>" "
+                        <span class="name">{t.name.clone()}</span>" "
+                        <span class="tag">{t.kind}</span>" "
+                        <span class="size">{fmt_size(t.size)}</span>
+                    </span>
+                    <span class="actions">
+                        <button class="accept" on:click=move |_| on_accept.run(id)>"Accept"</button>
+                        <button class="decline" on:click=move |_| on_decline.run(id)>"Decline"</button>
+                    </span>
+                </div>
+            </li>
+        }
+        .into_any(),
+        TransferState::Offered => view! {
+            <li class="row waiting">
+                <div class="top">
+                    <span>
+                        <span class="diricon">{arrow}</span>" "
+                        <span class="name">{t.name.clone()}</span>" "
+                        <span class="tag">{t.kind}</span>
+                    </span>
+                    <span class="pct">"WAITING…"</span>
+                </div>
+            </li>
+        }
+        .into_any(),
+        TransferState::Declined => view! {
+            <li class="row declined">
+                <div class="top">
+                    <span>
+                        <span class="diricon">{arrow}</span>" "
+                        <span class="name">{t.name.clone()}</span>" "
+                        <span class="tag">{t.kind}</span>
+                    </span>
+                    <span class="pct">"✗ DECLINED"</span>
+                </div>
+            </li>
+        }
+        .into_any(),
+        TransferState::Active | TransferState::Done => {
+            let done = t.state == TransferState::Done;
+            let row_class = if done { "row done" } else { "row" };
+            let pct_label = if done { "✓ DONE".to_string() } else { format!("{pct}%") };
+            let bar_style = format!("width:{pct}%");
+            view! {
+                <li class=row_class>
+                    <div class="top">
+                        <span>
+                            <span class="diricon">{arrow}</span>" "
+                            <span class="name">{t.name.clone()}</span>" "
+                            <span class="tag">{t.kind}</span>
+                        </span>
+                        <span class="pct">{pct_label}</span>
+                    </div>
+                    <div class="bar"><i style=bar_style></i></div>
+                </li>
+            }
+            .into_any()
+        }
     }
 }
 
@@ -155,5 +248,20 @@ pub fn JoinBox(on_join: Callback<String>) -> impl IntoView {
                 <button class="joinbtn" on:click=move |_| submit()>"Join"</button>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_size;
+
+    #[test]
+    fn formats_human_sizes() {
+        assert_eq!(fmt_size(0.0), "0 B");
+        assert_eq!(fmt_size(512.0), "512 B");
+        assert_eq!(fmt_size(1024.0), "1.0 KB");
+        assert_eq!(fmt_size(1536.0), "1.5 KB");
+        assert_eq!(fmt_size(1_048_576.0), "1.0 MB");
+        assert_eq!(fmt_size(1_073_741_824.0), "1.0 GB");
     }
 }

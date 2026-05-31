@@ -5,15 +5,14 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use shared::SignalMsg;
 use wasm_bindgen::JsCast;
-use web_sys::{
-    DragEvent, HtmlInputElement, RtcDataChannel, RtcDataChannelState, RtcPeerConnection, RtcSdpType,
-};
+use web_sys::{DragEvent, HtmlInputElement, RtcPeerConnection, RtcSdpType};
 
 use crate::filetype::file_kind;
+use crate::protocol::FileStart;
 use crate::qr::qr_svg;
 use crate::signaling::Signaling;
-use crate::transfer::{attach_receiver, send_files};
-use crate::ui::{FileProgress, JoinBox, ProgressList, ShareLink, Status, StatusBar};
+use crate::transfer::{Handlers, Transfer};
+use crate::ui::{JoinBox, ProgressList, ShareLink, Status, StatusBar, Transfer as Row, TransferState};
 use crate::webrtc;
 
 #[cfg(test)]
@@ -111,84 +110,169 @@ pub fn App() -> impl IntoView {
     let (status, set_status) = signal(Status::Idle);
     let (room_link, set_room_link) = signal(String::new());
     let (room_code, set_room_code) = signal(String::new());
-    let (progress, set_progress) = signal(Vec::<FileProgress>::new());
+    let (items, set_items) = signal(Vec::<Row>::new());
     let (qr, set_qr) = signal(String::new());
     let (drag_depth, set_drag_depth) = signal(0i32);
 
     // Shared handles populated as the connection is established.
     let pc: Rc<RefCell<Option<RtcPeerConnection>>> = Rc::new(RefCell::new(None));
-    let dc: Rc<RefCell<Option<RtcDataChannel>>> = Rc::new(RefCell::new(None));
+    let transfer: Rc<RefCell<Option<Transfer>>> = Rc::new(RefCell::new(None));
     let sig: Rc<RefCell<Option<Signaling>>> = Rc::new(RefCell::new(None));
-    // Files chosen before the data channel is open; flushed once it opens.
+    // Files chosen before the channel is open; their offers are sent on open.
     let pending: Rc<RefCell<Vec<web_sys::File>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // Helper to update one file's progress row.
-    let upsert_progress = move |name: String, fraction: f64, direction: &'static str| {
-        let kind = file_kind(&name, "");
-        let done = fraction >= 1.0;
-        set_progress.update(|list| {
-            if let Some(item) =
-                list.iter_mut().find(|p| p.name == name && p.direction == direction)
-            {
-                item.fraction = fraction;
-                item.done = done;
+    // Find-or-insert a transfer row keyed by (id, incoming), then mutate it.
+    let upsert_row = move |id: u64,
+                           incoming: bool,
+                           make: &dyn Fn() -> Row,
+                           apply: &dyn Fn(&mut Row)| {
+        set_items.update(|list| {
+            if let Some(row) = list.iter_mut().find(|r| r.id == id && r.incoming == incoming) {
+                apply(row);
             } else {
-                list.push(FileProgress { name, fraction, direction, kind, done });
+                let mut row = make();
+                apply(&mut row);
+                list.push(row);
             }
         });
     };
 
-    // Send a batch of files now over an open channel, reporting upload progress.
-    let send_now = move |channel: RtcDataChannel, files: Vec<web_sys::File>| {
-        let up = upsert_progress;
-        send_files(
-            channel,
-            files,
-            move |name, sent, total| {
+    // Build the transfer event handlers (UI updates).
+    let handlers = {
+        let make_incoming = move |meta: &FileStart| Row {
+            id: meta.id,
+            name: meta.name.clone(),
+            size: meta.size,
+            kind: file_kind(&meta.name, &meta.mime),
+            incoming: true,
+            fraction: 0.0,
+            state: TransferState::Offered,
+        };
+        Handlers {
+            on_offer: Rc::new(move |meta: FileStart| {
+                upsert_row(meta.id, true, &|| make_incoming(&meta), &|_r| {});
+            }),
+            on_recv_progress: Rc::new(move |id, name, recv, total| {
+                let frac = if total > 0.0 { recv / total } else { 1.0 };
+                upsert_row(
+                    id,
+                    true,
+                    &|| Row {
+                        id,
+                        name: name.clone(),
+                        size: total,
+                        kind: file_kind(&name, ""),
+                        incoming: true,
+                        fraction: frac,
+                        state: TransferState::Active,
+                    },
+                    &|r| {
+                        r.fraction = frac;
+                        r.state = TransferState::Active;
+                    },
+                );
+            }),
+            on_recv_complete: Rc::new(move |id, name| {
+                upsert_row(
+                    id,
+                    true,
+                    &|| Row {
+                        id,
+                        name: name.clone(),
+                        size: 0.0,
+                        kind: file_kind(&name, ""),
+                        incoming: true,
+                        fraction: 1.0,
+                        state: TransferState::Done,
+                    },
+                    &|r| {
+                        r.fraction = 1.0;
+                        r.state = TransferState::Done;
+                    },
+                );
+            }),
+            on_send_progress: Rc::new(move |id, name, sent, total| {
                 let frac = if total > 0.0 { sent / total } else { 1.0 };
-                up(name, frac, "↑");
-            },
-            || {},
-        );
+                let done = frac >= 1.0;
+                upsert_row(
+                    id,
+                    false,
+                    &|| Row {
+                        id,
+                        name: name.clone(),
+                        size: total,
+                        kind: file_kind(&name, ""),
+                        incoming: false,
+                        fraction: frac,
+                        state: if done { TransferState::Done } else { TransferState::Active },
+                    },
+                    &|r| {
+                        r.fraction = frac;
+                        r.state = if done { TransferState::Done } else { TransferState::Active };
+                    },
+                );
+            }),
+            on_rejected: Rc::new(move |id| {
+                set_items.update(|list| {
+                    if let Some(r) = list.iter_mut().find(|r| r.id == id && !r.incoming) {
+                        r.state = TransferState::Declined;
+                    }
+                });
+            }),
+        }
     };
 
-    // Wire a freshly-available data channel: receiver + mark connected.
+    // Offer a batch of files now and add their outgoing rows.
+    let offer_now: Rc<dyn Fn(Vec<web_sys::File>)> = {
+        let transfer = transfer.clone();
+        Rc::new(move |files: Vec<web_sys::File>| {
+            let offered = transfer
+                .borrow()
+                .as_ref()
+                .map(|t| t.offer_files(files))
+                .unwrap_or_default();
+            for (id, name, size) in offered {
+                set_items.update(|list| {
+                    list.push(Row {
+                        id,
+                        name: name.clone(),
+                        size,
+                        kind: file_kind(&name, ""),
+                        incoming: false,
+                        fraction: 0.0,
+                        state: TransferState::Offered,
+                    });
+                });
+            }
+        })
+    };
+
+    // Wire a freshly-available data channel: build the Transfer + flush queue on open.
     let wire_dc = {
-        let dc = dc.clone();
+        let transfer = transfer.clone();
         let pending = pending.clone();
-        Rc::new(move |channel: RtcDataChannel| {
-            let up = upsert_progress;
-            attach_receiver(
-                &channel,
-                move |name, recv, total| {
-                    let frac = if total > 0.0 { recv / total } else { 1.0 };
-                    up(name, frac, "↓");
-                },
-                move |name| {
-                    // Authoritative per-file completion on the receive side.
-                    up(name, 1.0, "↓");
-                },
-            );
-            // On open: mark connected and flush any files queued before connect.
+        let offer_now = offer_now.clone();
+        let handlers = handlers.clone();
+        Rc::new(move |channel: web_sys::RtcDataChannel| {
+            let t = Transfer::new(channel, handlers.clone());
+            // On open: mark connected and offer any files queued before connect.
             let pending = pending.clone();
-            let ch_for_open = channel.clone();
+            let offer_now = offer_now.clone();
             let onopen = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
                 set_status.set(Status::Connected);
                 let queued: Vec<web_sys::File> = pending.borrow_mut().drain(..).collect();
                 if !queued.is_empty() {
-                    send_now(ch_for_open.clone(), queued);
+                    offer_now(queued);
                 }
             });
-            channel.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-            onopen.forget();
-            *dc.borrow_mut() = Some(channel);
+            t.channel_set_onopen(onopen);
+            *transfer.borrow_mut() = Some(t);
         })
     };
 
     // Establish signaling + peer connection on mount.
     {
         let pc = pc.clone();
-        let dc_for_init = dc.clone();
         let sig = sig.clone();
         let wire_dc = wire_dc.clone();
         Effect::new(move |_| {
@@ -212,7 +296,6 @@ pub fn App() -> impl IntoView {
                 // Initiator creates the channel up front.
                 let channel = webrtc::create_data_channel(&peer);
                 wire_dc(channel);
-                let _ = &dc_for_init; // channel stored inside wire_dc
             }
 
             // Build signaling; route inbound messages.
@@ -292,24 +375,71 @@ pub fn App() -> impl IntoView {
         });
     }
 
-    // Drop-zone / file-input handler. Send immediately if the channel is open;
-    // otherwise queue the files and flush them when it opens (see wire_dc).
+    // File-input/drop handler: offer immediately if open, else queue for on-open.
     let on_files = {
-        let dc = dc.clone();
+        let transfer = transfer.clone();
         let pending = pending.clone();
+        let offer_now = offer_now.clone();
         move |files: Vec<web_sys::File>| {
             if files.is_empty() {
                 return;
             }
-            let open_channel = dc
-                .borrow()
-                .as_ref()
-                .filter(|c| c.ready_state() == RtcDataChannelState::Open)
-                .cloned();
-            match open_channel {
-                Some(channel) => send_now(channel, files),
-                None => pending.borrow_mut().extend(files),
+            let open = transfer.borrow().as_ref().map(|t| t.is_open()).unwrap_or(false);
+            if open {
+                offer_now(files);
+            } else {
+                pending.borrow_mut().extend(files);
             }
+        }
+    };
+
+    // Accept / decline an incoming offer.
+    let on_accept = {
+        let transfer = transfer.clone();
+        move |id: u64| {
+            if let Some(t) = transfer.borrow().as_ref() {
+                t.accept(id);
+            }
+            // Optimistically leave the Offered state so the buttons hide and a
+            // second click can't re-accept; real progress updates follow.
+            set_items.update(|list| {
+                if let Some(r) = list.iter_mut().find(|r| r.id == id && r.incoming) {
+                    r.state = TransferState::Active;
+                }
+            });
+        }
+    };
+    let on_decline = {
+        let transfer = transfer.clone();
+        move |id: u64| {
+            if let Some(t) = transfer.borrow().as_ref() {
+                t.reject(id);
+            }
+            // Remove the declined incoming row locally.
+            set_items.update(|list| list.retain(|r| !(r.id == id && r.incoming)));
+        }
+    };
+    let on_accept_all = {
+        let transfer = transfer.clone();
+        move || {
+            let ids: Vec<u64> = items
+                .get_untracked()
+                .iter()
+                .filter(|r| r.incoming && r.state == TransferState::Offered)
+                .map(|r| r.id)
+                .collect();
+            if let Some(t) = transfer.borrow().as_ref() {
+                for id in &ids {
+                    t.accept(*id);
+                }
+            }
+            set_items.update(|list| {
+                for r in list.iter_mut() {
+                    if r.incoming && ids.contains(&r.id) {
+                        r.state = TransferState::Active;
+                    }
+                }
+            });
         }
     };
 
@@ -389,7 +519,12 @@ pub fn App() -> impl IntoView {
                 <input type="file" multiple on:change=on_input_change />
             </div>
 
-            <ProgressList items=progress/>
+            <ProgressList
+                items=items
+                on_accept=UnsyncCallback::new(on_accept)
+                on_decline=UnsyncCallback::new(on_decline)
+                on_accept_all=UnsyncCallback::new(move |_| on_accept_all())
+            />
         </main>
     }
 }
