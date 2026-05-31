@@ -5,7 +5,9 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use shared::SignalMsg;
 use wasm_bindgen::JsCast;
-use web_sys::{DragEvent, HtmlInputElement, RtcDataChannel, RtcPeerConnection, RtcSdpType};
+use web_sys::{
+    DragEvent, HtmlInputElement, RtcDataChannel, RtcDataChannelState, RtcPeerConnection, RtcSdpType,
+};
 
 use crate::filetype::file_kind;
 use crate::qr::qr_svg;
@@ -117,6 +119,8 @@ pub fn App() -> impl IntoView {
     let pc: Rc<RefCell<Option<RtcPeerConnection>>> = Rc::new(RefCell::new(None));
     let dc: Rc<RefCell<Option<RtcDataChannel>>> = Rc::new(RefCell::new(None));
     let sig: Rc<RefCell<Option<Signaling>>> = Rc::new(RefCell::new(None));
+    // Files chosen before the data channel is open; flushed once it opens.
+    let pending: Rc<RefCell<Vec<web_sys::File>>> = Rc::new(RefCell::new(Vec::new()));
 
     // Helper to update one file's progress row.
     let upsert_progress = move |name: String, fraction: f64, direction: &'static str| {
@@ -134,9 +138,24 @@ pub fn App() -> impl IntoView {
         });
     };
 
+    // Send a batch of files now over an open channel, reporting upload progress.
+    let send_now = move |channel: RtcDataChannel, files: Vec<web_sys::File>| {
+        let up = upsert_progress;
+        send_files(
+            channel,
+            files,
+            move |name, sent, total| {
+                let frac = if total > 0.0 { sent / total } else { 1.0 };
+                up(name, frac, "↑");
+            },
+            || {},
+        );
+    };
+
     // Wire a freshly-available data channel: receiver + mark connected.
     let wire_dc = {
         let dc = dc.clone();
+        let pending = pending.clone();
         Rc::new(move |channel: RtcDataChannel| {
             let up = upsert_progress;
             attach_receiver(
@@ -150,9 +169,15 @@ pub fn App() -> impl IntoView {
                     up(name, 1.0, "↓");
                 },
             );
-            let set_status = set_status;
+            // On open: mark connected and flush any files queued before connect.
+            let pending = pending.clone();
+            let ch_for_open = channel.clone();
             let onopen = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
                 set_status.set(Status::Connected);
+                let queued: Vec<web_sys::File> = pending.borrow_mut().drain(..).collect();
+                if !queued.is_empty() {
+                    send_now(ch_for_open.clone(), queued);
+                }
             });
             channel.set_onopen(Some(onopen.as_ref().unchecked_ref()));
             onopen.forget();
@@ -267,24 +292,23 @@ pub fn App() -> impl IntoView {
         });
     }
 
-    // Drop-zone / file-input handler: send selected files.
+    // Drop-zone / file-input handler. Send immediately if the channel is open;
+    // otherwise queue the files and flush them when it opens (see wire_dc).
     let on_files = {
         let dc = dc.clone();
+        let pending = pending.clone();
         move |files: Vec<web_sys::File>| {
             if files.is_empty() {
                 return;
             }
-            if let Some(channel) = dc.borrow().as_ref() {
-                let up = upsert_progress;
-                send_files(
-                    channel.clone(),
-                    files,
-                    move |name, sent, total| {
-                        let frac = if total > 0.0 { sent / total } else { 1.0 };
-                        up(name, frac, "↑");
-                    },
-                    || {},
-                );
+            let open_channel = dc
+                .borrow()
+                .as_ref()
+                .filter(|c| c.ready_state() == RtcDataChannelState::Open)
+                .cloned();
+            match open_channel {
+                Some(channel) => send_now(channel, files),
+                None => pending.borrow_mut().extend(files),
             }
         }
     };
