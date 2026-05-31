@@ -11,8 +11,48 @@ use crate::filetype::file_kind;
 use crate::qr::qr_svg;
 use crate::signaling::Signaling;
 use crate::transfer::{attach_receiver, send_files};
-use crate::ui::{FileProgress, ProgressList, ShareLink, Status, StatusBar};
+use crate::ui::{FileProgress, JoinBox, ProgressList, ShareLink, Status, StatusBar};
 use crate::webrtc;
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_code;
+
+    #[test]
+    fn bare_code_is_trimmed_but_unchanged() {
+        assert_eq!(normalize_code("wzUIkaNl6u"), "wzUIkaNl6u");
+        assert_eq!(normalize_code("  wzUIkaNl6u  "), "wzUIkaNl6u");
+    }
+
+    #[test]
+    fn extracts_code_from_pasted_link_or_hash() {
+        assert_eq!(
+            normalize_code("http://localhost:3000/#/room/wzUIkaNl6u"),
+            "wzUIkaNl6u"
+        );
+        assert_eq!(normalize_code("#/room/abc123"), "abc123");
+        assert_eq!(
+            normalize_code("https://file-send.app/#/room/k7f2-9xqz/"),
+            "k7f2-9xqz"
+        );
+    }
+
+    #[test]
+    fn blank_input_yields_empty() {
+        assert_eq!(normalize_code("   "), "");
+    }
+}
+
+/// Extract a bare room code from user input. Accepts either a raw code or a
+/// pasted link/hash like `https://host/#/room/<code>`; returns the trimmed code
+/// (everything after the last `room/`, stripped of surrounding slashes).
+fn normalize_code(raw: &str) -> String {
+    let s = raw.trim();
+    match s.rfind("room/") {
+        Some(idx) => s[idx + "room/".len()..].trim_matches('/').trim().to_string(),
+        None => s.to_string(),
+    }
+}
 
 /// Read the room id from the URL hash (`#/room/<id>`), if present.
 fn room_from_hash() -> Option<String> {
@@ -26,6 +66,7 @@ fn room_from_hash() -> Option<String> {
 pub fn App() -> impl IntoView {
     let (status, set_status) = signal(Status::Idle);
     let (room_link, set_room_link) = signal(String::new());
+    let (room_code, set_room_code) = signal(String::new());
     let (progress, set_progress) = signal(Vec::<FileProgress>::new());
     let (qr, set_qr) = signal(String::new());
     let (drag_depth, set_drag_depth) = signal(0i32);
@@ -119,6 +160,7 @@ pub fn App() -> impl IntoView {
                         let link = format!("{origin}/#/room/{room}");
                         set_qr.set(qr_svg(&link));
                         set_room_link.set(link);
+                        set_room_code.set(room);
                         set_status.set(Status::WaitingForPeer);
                     }
                     SignalMsg::PeerJoined => {
@@ -243,6 +285,18 @@ pub fn App() -> impl IntoView {
 
     let drop_class = move || if drag_depth.get() > 0 { "drop active" } else { "drop" };
 
+    // Join an existing room by code: set the hash and reload so the mount
+    // effect re-runs as a joiner. A bad code surfaces as RoomNotFound.
+    let on_join = Callback::new(move |raw: String| {
+        let code = normalize_code(&raw);
+        if code.is_empty() {
+            return;
+        }
+        let loc = web_sys::window().unwrap().location();
+        let _ = loc.set_hash(&format!("/room/{code}"));
+        let _ = loc.reload();
+    });
+
     view! {
         <main class="container">
             <h1 class="wm">"File"<span>"·"</span><br/>"Send"</h1>
@@ -251,7 +305,11 @@ pub fn App() -> impl IntoView {
             <StatusBar status/>
 
             <Show when=move || !room_link.get().is_empty()>
-                <ShareLink link=room_link qr=qr/>
+                <ShareLink code=room_code link=room_link qr=qr/>
+            </Show>
+
+            <Show when=move || status.get() != Status::Connected>
+                <JoinBox on_join=on_join/>
             </Show>
 
             <div
