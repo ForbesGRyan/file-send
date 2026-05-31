@@ -89,33 +89,70 @@ pub fn ProgressList(items: ReadSignal<Vec<FileProgress>>) -> impl IntoView {
     }
 }
 
-/// Share block: readonly room link with a copy button, plus a QR code
-/// (an SVG string injected as inner HTML) for phone scanning.
+/// Copy `text` to the clipboard, fire-and-forget (the returned Promise is
+/// intentionally ignored).
+fn copy_to_clipboard(text: &str) {
+    if let Some(win) = web_sys::window() {
+        let _ = win.navigator().clipboard().write_text(text);
+    }
+}
+
+/// Share block: a prominent room code with a copy button and a QR code for
+/// phone scanning, plus the full share link demoted to a secondary row.
 #[component]
 pub fn ShareLink(
+    code: ReadSignal<String>,
     link: ReadSignal<String>,
     qr: ReadSignal<String>,
 ) -> impl IntoView {
-    let copy = move |_| {
-        let text = link.get_untracked();
-        if let Some(win) = web_sys::window() {
-            // Fire-and-forget; the returned Promise is intentionally ignored.
-            let _ = win.navigator().clipboard().write_text(&text);
-        }
-    };
+    let copy_code = move |_| copy_to_clipboard(&code.get_untracked());
+    let copy_link = move |_| copy_to_clipboard(&link.get_untracked());
     view! {
         <div class="block share">
             <div class="left">
                 <p class="label">"Share to connect a peer"</p>
-                <div class="linkrow">
+                <p class="codelabel">"Your room code"</p>
+                <div class="coderow">
+                    <span class="code">{move || code.get()}</span>
+                    <button class="copycode" on:click=copy_code>"Copy code"</button>
+                </div>
+                <div class="sharelink">
+                    <span class="sharelink-cap">"or link:"</span>
                     <input type="text" readonly prop:value=move || link.get() />
-                    <button class="copybtn" on:click=copy>"Copy"</button>
+                    <button class="copybtn small" on:click=copy_link>"Copy"</button>
                 </div>
                 <p class="note">"Link expires when you close the tab."</p>
             </div>
             <div class="qrwrap">
                 <div class="qr" inner_html=move || qr.get()></div>
                 <p class="qr-cap">"scan on phone"</p>
+            </div>
+        </div>
+    }
+}
+
+/// Input box to join an existing room by typing or pasting a code (or a link).
+#[component]
+pub fn JoinBox(on_join: Callback<String>) -> impl IntoView {
+    let (value, set_value) = signal(String::new());
+    let submit = move || on_join.run(value.get_untracked());
+    view! {
+        <div class="block joinbox">
+            <p class="label">"Have a code? Join a room"</p>
+            <div class="joinrow">
+                <input
+                    type="text"
+                    class="joininput"
+                    placeholder="enter code or paste link"
+                    prop:value=move || value.get()
+                    on:input=move |ev| set_value.set(event_target_value(&ev))
+                    on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                        if ev.key() == "Enter" {
+                            submit();
+                        }
+                    }
+                />
+                <button class="joinbtn" on:click=move |_| submit()>"Join"</button>
             </div>
         </div>
     }

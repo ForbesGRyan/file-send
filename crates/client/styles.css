@@ -91,6 +91,59 @@ body {
   text-align: center; margin: 6px 0 0; text-transform: uppercase;
 }
 
+/* Room code (prominent) */
+.codelabel {
+  font-family: "Space Mono", monospace;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  margin: 0 0 6px; opacity: 0.7;
+}
+.coderow { display: flex; align-items: stretch; border: 3px solid var(--ink); margin-bottom: 12px; }
+.code {
+  flex: 1; min-width: 0;
+  font-family: "Archivo Black", sans-serif;
+  font-size: clamp(20px, 5vw, 30px); letter-spacing: 2px;
+  padding: 10px 14px; background: var(--paper);
+  display: flex; align-items: center;
+  overflow-x: auto; white-space: nowrap;
+}
+.copycode {
+  border: 0; border-left: 3px solid var(--ink);
+  background: var(--orange); color: var(--ink);
+  font-family: "Archivo Black", sans-serif; font-size: 12px;
+  padding: 0 16px; text-transform: uppercase; cursor: pointer; white-space: nowrap;
+}
+.copycode:active { background: var(--ink); color: var(--paper); }
+
+/* Demoted share link */
+.sharelink { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sharelink-cap {
+  font-family: "Space Mono", monospace; font-size: 10px;
+  text-transform: uppercase; white-space: nowrap; opacity: 0.7;
+}
+.sharelink input {
+  flex: 1; min-width: 0; border: 2px solid var(--ink); padding: 6px 8px;
+  font-family: "Space Mono", monospace; font-size: 11px;
+  background: var(--paper); color: var(--ink);
+}
+.copybtn.small { border: 2px solid var(--ink); font-size: 10px; padding: 0 10px; }
+
+/* Join box */
+.joinbox .label { margin-bottom: 10px; }
+.joinrow { display: flex; border: 3px solid var(--ink); }
+.joininput {
+  flex: 1; min-width: 0; border: 0; padding: 12px;
+  font-family: "Space Mono", monospace; font-size: 14px;
+  background: var(--paper); color: var(--ink);
+}
+.joininput::placeholder { color: var(--ink); opacity: 0.4; }
+.joinbtn {
+  border: 0; border-left: 3px solid var(--ink);
+  background: var(--ink); color: var(--paper);
+  font-family: "Archivo Black", sans-serif; font-size: 14px;
+  padding: 0 22px; text-transform: uppercase; cursor: pointer;
+}
+.joinbtn:active { background: var(--orange); color: var(--ink); }
+
 /* Drop zone */
 .drop {
   border: 3px dashed var(--ink);
