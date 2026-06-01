@@ -201,6 +201,9 @@ fn install_recv_router(shared: &Rc<Shared>, dc: RtcDataChannel) {
     let cur_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let shared_for_cb = shared.clone();
     let cur = cur_id.clone();
+    // Closing the channel is the receiver's job (see the `End` arm below), so the
+    // message handler needs its own handle to the channel.
+    let dc_for_close = dc.clone();
     let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
         let shared = &shared_for_cb;
         let data = e.data();
@@ -221,6 +224,14 @@ fn install_recv_router(shared: &Rc<Shared>, dc: RtcDataChannel) {
                     if let Some(id) = cur.get() {
                         finalize_recv(shared, id);
                     }
+                    // The receiver now holds every byte: `End` follows all chunks,
+                    // and SCTP delivers a stream in order, so its arrival proves the
+                    // chunks arrived. Close from this side. The sender must NOT close
+                    // right after its last `send()` — that resets the SCTP stream
+                    // while the just-queued bytes may still be in flight, and Chrome
+                    // discards them, so a small/fast file lands as 0 bytes. Resetting
+                    // from the side that already has the data carries no such risk.
+                    dc_for_close.close();
                 }
                 _ => {}
             }
@@ -275,13 +286,19 @@ async fn send_file_on_channel(shared: Rc<Shared>, id: u64, file: File) {
     let chunk = max_message_size(&shared.pc).min(CHUNK_SIZE);
     let _ = send_file(dc.clone(), id, file, chunk, prog, &is_cancelled).await;
     if is_cancelled() {
-        // Peer aborted mid-stream; the UI is already marked cancelled.
+        // Peer aborted mid-stream; the UI is already marked cancelled. The receiver
+        // is discarding this file, so close from here — losing the bytes still in
+        // the SCTP buffer is exactly what cancelling means.
         shared.outgoing.borrow_mut().cancelled.remove(&id);
+        dc.close();
     } else {
         // Guarantee a final 100% (also covers 0-byte files that emit no chunks).
         (shared.handlers.on_send_progress)(id, name, total, total);
+        // Do NOT close here. Closing right after the last `send()` resets the SCTP
+        // stream while the just-queued bytes may not yet be on the wire, and Chrome
+        // discards them — a small/fast file then arrives as 0 bytes. The receiver
+        // closes the channel once it has the file (on `End`); see install_recv_router.
     }
-    dc.close();
 
     // Free this slot and start any files waiting on the concurrency cap.
     let next = {
