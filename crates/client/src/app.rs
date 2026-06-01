@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -118,8 +118,13 @@ pub fn App() -> impl IntoView {
     let pc: Rc<RefCell<Option<RtcPeerConnection>>> = Rc::new(RefCell::new(None));
     let transfer: Rc<RefCell<Option<Transfer>>> = Rc::new(RefCell::new(None));
     let sig: Rc<RefCell<Option<Signaling>>> = Rc::new(RefCell::new(None));
-    // Files chosen before the channel is open; their offers are sent on open.
-    let pending: Rc<RefCell<Vec<web_sys::File>>> = Rc::new(RefCell::new(Vec::new()));
+    // Monotonic id for outgoing files. Assigned the moment a file is added (not when
+    // its offer is sent) so a file picked before the channel is open can be shown as
+    // a Pending row right away and later reconciled by id.
+    let next_id: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    // Files chosen before the channel is open, with their assigned ids; their offers
+    // are sent on open.
+    let pending: Rc<RefCell<Vec<(u64, web_sys::File)>>> = Rc::new(RefCell::new(Vec::new()));
 
     // Build the transfer event handlers. Each is a thin wrapper that applies a
     // pure `rows` transition inside `set_items.update`; the logic itself lives
@@ -145,17 +150,17 @@ pub fn App() -> impl IntoView {
         }),
     };
 
-    // Offer a batch of files now and add their outgoing rows.
-    let offer_now: Rc<dyn Fn(Vec<web_sys::File>)> = {
+    // Send offers for a batch of already-id'd files (their Pending rows already
+    // exist) and flip each row Pending -> Offered.
+    let offer_now: Rc<dyn Fn(Vec<(u64, web_sys::File)>)> = {
         let transfer = transfer.clone();
-        Rc::new(move |files: Vec<web_sys::File>| {
-            let offered = transfer
-                .borrow()
-                .as_ref()
-                .map(|t| t.offer_files(files))
-                .unwrap_or_default();
-            for (id, name, size) in offered {
-                set_items.update(|list| rows::push_outgoing_offer(list, id, &name, size));
+        Rc::new(move |files: Vec<(u64, web_sys::File)>| {
+            let ids: Vec<u64> = files.iter().map(|(id, _)| *id).collect();
+            if let Some(t) = transfer.borrow().as_ref() {
+                t.offer_files(files);
+            }
+            for id in ids {
+                set_items.update(|list| rows::mark_offered(list, id));
             }
         })
     };
@@ -173,7 +178,7 @@ pub fn App() -> impl IntoView {
             let offer_now = offer_now.clone();
             let onopen = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
                 set_status.set(Status::Connected);
-                let queued: Vec<web_sys::File> = pending.borrow_mut().drain(..).collect();
+                let queued: Vec<(u64, web_sys::File)> = pending.borrow_mut().drain(..).collect();
                 if !queued.is_empty() {
                     offer_now(queued);
                 }
@@ -307,20 +312,32 @@ pub fn App() -> impl IntoView {
         });
     }
 
-    // File-input/drop handler: offer immediately if open, else queue for on-open.
+    // File-input/drop handler: show a row for every file immediately, then offer
+    // now if the channel is open, else queue the offer for on-open. Assigning the
+    // id and rendering the row up front means a file added before the connection is
+    // ready appears as Pending instead of silently disappearing.
     let on_files = {
         let transfer = transfer.clone();
         let pending = pending.clone();
         let offer_now = offer_now.clone();
+        let next_id = next_id.clone();
         move |files: Vec<web_sys::File>| {
             if files.is_empty() {
                 return;
             }
+            let mut batch = Vec::with_capacity(files.len());
+            for file in files {
+                let id = next_id.get();
+                next_id.set(id + 1);
+                set_items
+                    .update(|list| rows::push_outgoing_pending(list, id, &file.name(), file.size()));
+                batch.push((id, file));
+            }
             let open = transfer.borrow().as_ref().map(|t| t.is_open()).unwrap_or(false);
             if open {
-                offer_now(files);
+                offer_now(batch);
             } else {
-                pending.borrow_mut().extend(files);
+                pending.borrow_mut().extend(batch);
             }
         }
     };

@@ -72,7 +72,6 @@ struct Shared {
     pc: RtcPeerConnection,
     ctrl: RtcDataChannel,
     handlers: Handlers,
-    next_id: Cell<u64>,
     incoming: RefCell<HashMap<u64, Incoming>>,
     outgoing: RefCell<Outgoing<File>>,
 }
@@ -92,7 +91,6 @@ impl Transfer {
             pc,
             ctrl,
             handlers,
-            next_id: Cell::new(0),
             incoming: RefCell::new(HashMap::new()),
             outgoing: RefCell::new(Outgoing::default()),
         });
@@ -105,24 +103,21 @@ impl Transfer {
         self.shared.ctrl.ready_state() == RtcDataChannelState::Open
     }
 
-    /// Announce `files` to the peer (one `Offer` each). Returns the offered
-    /// `(id, name, size)` list so the caller can render outgoing rows.
-    pub fn offer_files(&self, files: Vec<File>) -> Vec<(u64, String, f64)> {
-        let mut offered = Vec::new();
-        for file in files {
-            let id = self.shared.next_id.get();
-            self.shared.next_id.set(id + 1);
+    /// Announce already-id'd `files` to the peer (one `Offer` each). The caller
+    /// assigns ids up front (so a file can be shown the moment it is added, before
+    /// the channel is open); this sends the offers and remembers each file for when
+    /// the peer accepts.
+    pub fn offer_files(&self, files: Vec<(u64, File)>) {
+        for (id, file) in files {
             let meta = FileStart {
                 id,
                 name: file.name(),
                 size: file.size(),
                 mime: file.type_(),
             };
-            let _ = self.shared.ctrl.send_with_str(&encode_control(&Control::Offer(meta.clone())));
-            offered.push((id, meta.name.clone(), meta.size));
+            let _ = self.shared.ctrl.send_with_str(&encode_control(&Control::Offer(meta)));
             self.shared.outgoing.borrow_mut().offered.insert(id, file);
         }
-        offered
     }
 
     /// Accept an incoming offered file (sends `Accept{id}` to the sender).

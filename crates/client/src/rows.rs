@@ -127,8 +127,10 @@ pub fn send_progress(list: &mut Vec<Row>, id: u64, name: &str, sent: f64, total:
     );
 }
 
-/// Append outgoing `Offered` rows for files we've just announced.
-pub fn push_outgoing_offer(list: &mut Vec<Row>, id: u64, name: &str, size: f64) {
+/// Append an outgoing `Pending` row for a file added before the channel is open.
+/// Without this the file would be queued invisibly and look like it vanished; the
+/// row flips to `Offered` once its offer actually goes out (see [`mark_offered`]).
+pub fn push_outgoing_pending(list: &mut Vec<Row>, id: u64, name: &str, size: f64) {
     list.push(Row {
         id,
         name: name.to_string(),
@@ -137,8 +139,19 @@ pub fn push_outgoing_offer(list: &mut Vec<Row>, id: u64, name: &str, size: f64) 
         incoming: false,
         fraction: 0.0,
         speed: 0.0,
-        state: TransferState::Offered,
+        state: TransferState::Pending,
     });
+}
+
+/// An outgoing file's offer has now been sent: move its `Pending` row to
+/// `Offered`. Only touches a still-`Pending` row, so it can't clobber a transfer
+/// that has already advanced (Active/Done/etc.).
+pub fn mark_offered(list: &mut [Row], id: u64) {
+    if let Some(r) = list.iter_mut().find(|r| r.id == id && !r.incoming) {
+        if r.state == TransferState::Pending {
+            r.state = TransferState::Offered;
+        }
+    }
 }
 
 /// Peer declined our outgoing file: mark it Declined.
@@ -284,18 +297,38 @@ mod tests {
     }
 
     #[test]
-    fn push_outgoing_offer_appends_offered_row() {
+    fn pending_row_then_offered() {
         let mut list = Vec::new();
-        push_outgoing_offer(&mut list, 3, "doc.zip", 99.0);
-        assert_eq!(list[0].state, TransferState::Offered);
+        push_outgoing_pending(&mut list, 5, "a.bin", 10.0);
+        assert_eq!(list.len(), 1);
         assert!(!list[0].incoming);
-        assert_eq!(list[0].size, 99.0);
+        assert_eq!(list[0].state, TransferState::Pending);
+        mark_offered(&mut list, 5);
+        assert_eq!(list[0].state, TransferState::Offered);
+    }
+
+    #[test]
+    fn mark_offered_only_promotes_pending_rows() {
+        let mut list = Vec::new();
+        // An outgoing file already sending must not be reset to Offered.
+        send_progress(&mut list, 1, "x", 50.0, 100.0); // Active
+        mark_offered(&mut list, 1);
+        assert_eq!(list[0].state, TransferState::Active);
+        // An incoming row with the same id is untouched.
+        incoming_offer(&mut list, &meta(2, "y", 1.0));
+        push_outgoing_pending(&mut list, 2, "y", 1.0);
+        mark_offered(&mut list, 2);
+        let inc = list.iter().find(|r| r.id == 2 && r.incoming).unwrap();
+        let out = list.iter().find(|r| r.id == 2 && !r.incoming).unwrap();
+        assert_eq!(inc.state, TransferState::Offered); // incoming offer state, unchanged
+        assert_eq!(out.state, TransferState::Offered); // outgoing promoted from Pending
     }
 
     #[test]
     fn mark_rejected_only_hits_outgoing() {
         let mut list = Vec::new();
-        push_outgoing_offer(&mut list, 1, "x", 1.0);
+        push_outgoing_pending(&mut list, 1, "x", 1.0);
+        mark_offered(&mut list, 1);
         incoming_offer(&mut list, &meta(1, "x", 1.0));
         mark_rejected(&mut list, 1);
         let out = list.iter().find(|r| !r.incoming).unwrap();
@@ -334,7 +367,8 @@ mod tests {
         let mut list = Vec::new();
         incoming_offer(&mut list, &meta(1, "a", 1.0));
         incoming_offer(&mut list, &meta(2, "b", 1.0));
-        push_outgoing_offer(&mut list, 3, "c", 1.0); // outgoing, must be ignored
+        push_outgoing_pending(&mut list, 3, "c", 1.0); // outgoing, must be ignored
+        mark_offered(&mut list, 3);
         let ids = pending_incoming_ids(&list);
         assert_eq!(ids, vec![1, 2]);
         accept_all(&mut list, &ids);

@@ -50,6 +50,10 @@ pub fn fmt_size(bytes: f64) -> String {
 /// Lifecycle state of one transfer row.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TransferState {
+    /// Outgoing only: added locally but not yet offered because the channel isn't
+    /// open yet (e.g. still waiting for a peer to join). Flips to `Offered` once the
+    /// offer is sent.
+    Pending,
     /// Incoming: awaiting the local user's accept/decline. Outgoing: awaiting the peer.
     Offered,
     /// Bytes are flowing.
@@ -135,6 +139,21 @@ fn transfer_row(
     let incoming = t.incoming;
     let arrow = if t.incoming { "↓" } else { "↑" };
     match t.state {
+        // Added but not yet offered (channel not open): show it waiting instead of
+        // letting the file vanish into the pre-connection queue.
+        TransferState::Pending => view! {
+            <li class="row waiting">
+                <div class="top">
+                    <span>
+                        <span class="diricon">{arrow}</span>" "
+                        <span class="name">{t.name.clone()}</span>" "
+                        <span class="tag">{t.kind}</span>
+                    </span>
+                    <span class="pct">"PENDING…"</span>
+                </div>
+            </li>
+        }
+        .into_any(),
         TransferState::Offered if t.incoming => view! {
             <li class="row offer">
                 <div class="top">
