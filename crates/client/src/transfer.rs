@@ -24,14 +24,23 @@ use web_sys::{
     Blob, File, MessageEvent, RtcDataChannel, RtcDataChannelState, RtcPeerConnection, Url,
 };
 
-use crate::protocol::{decode_control, encode_control, Control, FileEnd, FileStart, CHUNK_SIZE};
+use crate::protocol::{
+    decode_control, encode_control, split_ranges, Control, FileEnd, FileStart, CHUNK_SIZE,
+    SLAB_SIZE,
+};
 use crate::transfer_state::{
     account_chunk, cancel_outgoing, enqueue_accepted, finalize_decision, schedule, Incoming,
     Outgoing,
 };
 
-/// High-water mark for buffered bytes on a file channel; pause sending above it.
-const BUFFER_HIGH: f64 = 1_000_000.0;
+/// Pause sending once this many bytes sit unsent in the channel's SCTP buffer.
+/// Well under Chrome's ~16 MB send-buffer ceiling (which throws if exceeded).
+const BUFFER_HIGH: f64 = 8.0 * 1024.0 * 1024.0;
+
+/// Resume sending once the buffer drains below this (the `bufferedamountlow`
+/// threshold). The gap to [`BUFFER_HIGH`] is hysteresis: a wide gap means we
+/// pause rarely and keep the pipe full instead of stalling per chunk.
+const BUFFER_LOW: u32 = 1024 * 1024;
 
 /// Maximum number of files streaming at once. Further accepts queue.
 const MAX_CONCURRENT: usize = 4;
@@ -262,7 +271,9 @@ async fn send_file_on_channel(shared: Rc<Shared>, id: u64, file: File) {
         let shared = shared.clone();
         move || shared.outgoing.borrow().cancelled.contains(&id)
     };
-    let _ = send_file(dc.clone(), id, file, prog, &is_cancelled).await;
+    // Never hand SCTP a message larger than the negotiated maxMessageSize.
+    let chunk = max_message_size(&shared.pc).min(CHUNK_SIZE);
+    let _ = send_file(dc.clone(), id, file, chunk, prog, &is_cancelled).await;
     if is_cancelled() {
         // Peer aborted mid-stream; the UI is already marked cancelled.
         shared.outgoing.borrow_mut().cancelled.remove(&id);
@@ -299,11 +310,37 @@ async fn await_channel_open(dc: &RtcDataChannel) {
     let _ = JsFuture::from(promise).await;
 }
 
+/// The channel's negotiated SCTP `maxMessageSize`, or [`usize::MAX`] when it's
+/// unavailable or unbounded. Read via reflection (`pc.sctp.maxMessageSize`)
+/// because web-sys 0.3 has no `RtcSctpTransport` binding. The SCTP transport
+/// (and thus this limit) exists once the connection is up, which it is by the
+/// time we stream a file.
+fn max_message_size(pc: &RtcPeerConnection) -> usize {
+    let mms = js_sys::Reflect::get(pc, &JsValue::from_str("sctp"))
+        .ok()
+        .filter(|sctp| !sctp.is_null() && !sctp.is_undefined())
+        .and_then(|sctp| js_sys::Reflect::get(&sctp, &JsValue::from_str("maxMessageSize")).ok())
+        .and_then(|v| v.as_f64());
+    // A non-finite value means "no limit"; 0 has historically meant the same.
+    // Either way fall back to unbounded and let CHUNK_SIZE govern.
+    match mms {
+        Some(m) if m.is_finite() && m >= 1.0 => m as usize,
+        _ => usize::MAX,
+    }
+}
+
 /// Send one file on its channel: `Start` -> chunks (with backpressure) -> `End`.
+///
+/// Reads the file in [`SLAB_SIZE`] slabs and slices each into `chunk`-sized
+/// messages in memory, prefetching the next slab while the current one streams
+/// so reads overlap sends. Sending paces on the `bufferedamountlow` event
+/// (see [`await_buffered_low`]) rather than a timer, which would be throttled in
+/// a background tab.
 async fn send_file(
     dc: RtcDataChannel,
     id: u64,
     file: File,
+    chunk: usize,
     on_progress: impl Fn(f64) + 'static,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), JsValue> {
@@ -315,31 +352,88 @@ async fn send_file(
         mime: file.type_(),
     });
     dc.send_with_str(&encode_control(&start))?;
+    // Fire `bufferedamountlow` once the buffer drains below this so we can pace
+    // sending on a network event rather than a timer (timers are throttled to
+    // ~1/sec in background tabs, which collapses throughput).
+    dc.set_buffered_amount_low_threshold(BUFFER_LOW);
 
-    let mut offset: f64 = 0.0;
+    // Start an `arrayBuffer()` read for one slab. The browser fills it in the
+    // background, so the next slab can be read while the current one is still
+    // being sent — overlapping file I/O with sending instead of stalling on
+    // each read (reads were ~50% of wall time when serialized).
+    let read_slab = |range: (u64, u64)| -> Result<JsFuture, JsValue> {
+        let blob = file.slice_with_f64_and_f64(range.0 as f64, range.1 as f64)?;
+        Ok(JsFuture::from(blob.array_buffer()))
+    };
+    let ranges = split_ranges(size as u64, SLAB_SIZE);
+    let mut idx = 0usize;
+    // Prime the pipeline: kick off the first read before the loop.
+    let mut pending = match ranges.first() {
+        Some(&r) => Some(read_slab(r)?),
+        None => None,
+    };
+
     let mut sent: f64 = 0.0;
-    while offset < size {
+    while let Some(fut) = pending.take() {
         // Stop early if the receiver cancelled; no `End` is sent.
         if is_cancelled() {
             return Ok(());
         }
-        let end = (offset + CHUNK_SIZE as f64).min(size);
-        let blob = file.slice_with_f64_and_f64(offset, end)?;
-        let buf = JsFuture::from(blob.array_buffer()).await?;
-        let array = js_sys::Uint8Array::new(&buf);
+        let buf = fut.await?;
+        let slab = js_sys::Uint8Array::new(&buf);
+        let slab_len = slab.length();
 
-        while dc.buffered_amount() as f64 > BUFFER_HIGH {
-            yield_to_event_loop().await;
+        // Kick off the next slab's read now so it overlaps the sends below.
+        idx += 1;
+        if let Some(&r) = ranges.get(idx) {
+            pending = Some(read_slab(r)?);
         }
 
-        dc.send_with_array_buffer(&array.buffer())?;
-        sent += array.length() as f64;
-        offset = end;
-        on_progress(sent);
+        let mut off: u32 = 0;
+        while off < slab_len {
+            if is_cancelled() {
+                return Ok(());
+            }
+            let end = (off + chunk as u32).min(slab_len);
+            // `subarray` is a zero-copy view into the slab; the send copies it
+            // into the SCTP buffer. (Using `.buffer()` here would send the whole
+            // slab, not the chunk — the view is what bounds the message size.)
+            let view = slab.subarray(off, end);
+
+            // Wait for the buffer to drain via the bufferedamountlow event, not a
+            // timer. (Synchronous code can't change buffered_amount mid-check, so
+            // there's no lost-wakeup race between the test and the await.)
+            if dc.buffered_amount() as f64 > BUFFER_HIGH {
+                await_buffered_low(&dc).await;
+            }
+
+            dc.send_with_array_buffer_view(&view)?;
+            sent += (end - off) as f64;
+            off = end;
+            on_progress(sent);
+        }
     }
 
     dc.send_with_str(&encode_control(&Control::End(FileEnd { id })))?;
     Ok(())
+}
+
+/// Resolve once the channel's buffered amount drains below its
+/// `bufferedAmountLowThreshold`. Driven by the `bufferedamountlow` event, which
+/// the network stack fires on drain — unlike `setTimeout`, it is not throttled
+/// in background tabs, so sending keeps pace whether or not the tab is focused.
+async fn await_buffered_low(dc: &RtcDataChannel) {
+    let dc2 = dc.clone();
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let dc3 = dc2.clone();
+        let cb = Closure::once(Box::new(move || {
+            dc3.set_onbufferedamountlow(None);
+            let _ = resolve.call0(&JsValue::NULL);
+        }) as Box<dyn FnOnce()>);
+        dc2.set_onbufferedamountlow(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    });
+    let _ = JsFuture::from(promise).await;
 }
 
 /// Yield control to the browser event loop for one timer tick.

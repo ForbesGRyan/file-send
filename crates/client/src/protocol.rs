@@ -5,8 +5,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Recommended chunk size in bytes (safe for WebRTC data channels).
-pub const CHUNK_SIZE: usize = 16 * 1024;
+/// Bytes per data-channel message. 256 KB sits within the SCTP
+/// `maxMessageSize` that modern browsers negotiate; the sender still clamps to
+/// the channel's actual limit at runtime in case a peer advertises less.
+pub const CHUNK_SIZE: usize = 256 * 1024;
+
+/// Bytes read from the `File` per async `arrayBuffer()` await. The sender reads
+/// in large slabs and slices them in memory, so it pays one event-loop round
+/// trip per slab instead of one per [`CHUNK_SIZE`] message. That per-await
+/// latency — not the link — is what caps throughput, so a big slab matters more
+/// than a big chunk.
+pub const SLAB_SIZE: usize = 8 * 1024 * 1024;
 
 /// JSON control frame announcing the next file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,12 +60,24 @@ pub fn decode_control(s: &str) -> Option<Control> {
     serde_json::from_str(s).ok()
 }
 
-/// Split a byte buffer into chunks of at most `CHUNK_SIZE`.
-pub fn chunk_bytes(data: &[u8]) -> Vec<&[u8]> {
-    if data.is_empty() {
+/// Split `[0, total)` into consecutive half-open `(start, end)` byte ranges of
+/// at most `step` bytes (the last range holds the remainder). A `step` of 0,
+/// or a `total` of 0, yields no ranges. This drives both the slab reads and the
+/// per-message chunking on the send path, and is the unit under the throughput
+/// test: fewer slab ranges == fewer awaited file reads == higher throughput.
+pub fn split_ranges(total: u64, step: usize) -> Vec<(u64, u64)> {
+    if step == 0 {
         return vec![];
     }
-    data.chunks(CHUNK_SIZE).collect()
+    let step = step as u64;
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < total {
+        let end = (start + step).min(total);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
 }
 
 #[cfg(test)]
@@ -88,22 +109,6 @@ mod tests {
     }
 
     #[test]
-    fn chunks_cover_all_bytes_and_reassemble() {
-        let data: Vec<u8> = (0..(CHUNK_SIZE * 2 + 5)).map(|i| (i % 256) as u8).collect();
-        let chunks = chunk_bytes(&data);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks[0].len() == CHUNK_SIZE && chunks[1].len() == CHUNK_SIZE);
-        assert_eq!(chunks[2].len(), 5);
-        let reassembled: Vec<u8> = chunks.concat();
-        assert_eq!(reassembled, data);
-    }
-
-    #[test]
-    fn empty_input_yields_no_chunks() {
-        assert!(chunk_bytes(&[]).is_empty());
-    }
-
-    #[test]
     fn control_roundtrip_offer() {
         let c = Control::Offer(FileStart {
             id: 3,
@@ -127,6 +132,47 @@ mod tests {
     fn control_roundtrip_cancel() {
         let c = Control::Cancel { id: 8 };
         assert_eq!(decode_control(&encode_control(&c)), Some(c));
+    }
+
+    #[test]
+    fn split_ranges_are_contiguous_and_cover_total() {
+        let total = SLAB_SIZE as u64 * 2 + 123;
+        let ranges = split_ranges(total, SLAB_SIZE);
+        assert_eq!(ranges.first().unwrap().0, 0, "starts at 0");
+        assert_eq!(ranges.last().unwrap().1, total, "ends at total");
+        for w in ranges.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "no gaps or overlap between ranges");
+        }
+        let covered: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(covered, total, "every byte covered exactly once");
+        // All but the last are full-size; the last is the remainder.
+        assert!(ranges[..ranges.len() - 1].iter().all(|(s, e)| e - s == SLAB_SIZE as u64));
+        assert_eq!(ranges.last().unwrap().1 - ranges.last().unwrap().0, 123);
+    }
+
+    #[test]
+    fn split_ranges_handles_empty_and_zero_step() {
+        assert!(split_ranges(0, SLAB_SIZE).is_empty(), "zero-byte file: no reads");
+        assert!(split_ranges(100, 0).is_empty(), "zero step: no ranges (no infinite loop)");
+    }
+
+    /// Throughput check. We established the transfer is latency-bound: the cap is
+    /// the number of awaited `File` reads (one event-loop round trip each), not
+    /// the link. Reading in [`SLAB_SIZE`] slabs instead of one await per
+    /// 16-KB chunk (the old behavior) must cut those reads by orders of
+    /// magnitude — that reduction *is* the speedup.
+    #[test]
+    fn slab_reads_collapse_event_loop_round_trips() {
+        let size = 256 * 1024 * 1024; // a 256 MB transfer
+        let old_per_chunk_reads = split_ranges(size, 16 * 1024).len(); // pre-change loop
+        let new_slab_reads = split_ranges(size, SLAB_SIZE).len();
+        assert_eq!(old_per_chunk_reads, 16_384, "old: one awaited read per 16 KB");
+        assert_eq!(new_slab_reads, 32, "new: one awaited read per 8 MB slab");
+        assert!(
+            old_per_chunk_reads / new_slab_reads >= 100,
+            "expected >=100x fewer awaited reads, got {}x",
+            old_per_chunk_reads / new_slab_reads
+        );
     }
 
     #[test]
