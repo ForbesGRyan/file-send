@@ -1,0 +1,16 @@
+# `cargo cov` — line coverage of the natively-testable code.
+#
+# The client crate is a WASM/Leptos app: its UI components (`ui.rs`), the
+# `App` component and effects (`app.rs`), the WebRTC and WebSocket wrappers
+# (`webrtc.rs`, `signaling.rs`), the data-channel wiring (`transfer.rs`), and
+# the `main.rs` entry points all call into the browser and can only run inside
+# a headless-browser wasm-bindgen-test harness — never under native `cargo
+# test`. Counting them as "uncovered" would just measure "code a unit test
+# can't reach", not test quality.
+#
+# The pure logic those modules lean on is deliberately split into browser-free
+# modules (`rows.rs`, `protocol.rs`, `transfer_state.rs`, `filetype.rs`, …) and
+# is what this report measures. To also exercise the excluded glue, stand up a
+# wasm-bindgen-test harness and run `wasm-pack test --headless`.
+[alias]
+cov = ['llvm-cov', '--workspace', '--ignore-filename-regex', 'src[\\/](app|ui|webrtc|signaling|transfer|main)\.rs$']

@@ -5,6 +5,7 @@ mod qr;
 mod rows;
 mod signaling;
 mod transfer;
+mod transfer_state;
 mod ui;
 mod webrtc;
 
