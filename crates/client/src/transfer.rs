@@ -422,6 +422,13 @@ async fn send_file(
             // there's no lost-wakeup race between the test and the await.)
             if dc.buffered_amount() as f64 > BUFFER_HIGH {
                 await_buffered_low(&dc).await;
+                // A `Cancel` may have arrived while parked on the await. Re-check
+                // before sending/reporting another chunk: otherwise this iteration's
+                // `on_progress` would overwrite the `Cancelled` row back to `Active`,
+                // freezing the sender's UI mid-progress instead of showing cancelled.
+                if is_cancelled() {
+                    return Ok(());
+                }
             }
 
             dc.send_with_array_buffer_view(&view)?;
