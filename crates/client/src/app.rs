@@ -478,6 +478,19 @@ pub fn App() -> impl IntoView {
 
             <StatusBar status/>
 
+            // Dead-end recovery: a missing/expired room leaves nowhere to go, so
+            // offer a one-click escape to the root, which starts a fresh room.
+            <Show when=move || status.get() == Status::RoomNotFound>
+                <button
+                    class="newroom"
+                    on:click=move |_| {
+                        let _ = web_sys::window().unwrap().location().set_href("/");
+                    }
+                >
+                    "Start a new room"
+                </button>
+            </Show>
+
             <Show when=move || !room_link.get().is_empty()>
                 <ShareLink code=room_code link=room_link qr=qr/>
             </Show>

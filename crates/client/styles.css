@@ -57,6 +57,21 @@ button, input { -webkit-tap-highlight-color: transparent; }
 .dot { width: 14px; height: 14px; background: var(--orange); border: 2px solid var(--ink); flex-shrink: 0; }
 .status { font-weight: 700; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
 
+/* Recovery action shown on a dead-end status (e.g. room not found / expired). */
+.newroom {
+  display: inline-block; margin: 0 0 18px; cursor: pointer;
+  border: 3px solid var(--ink); background: var(--ink); color: var(--paper);
+  font-family: "Archivo Black", sans-serif; font-size: 13px;
+  text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 22px;
+  box-shadow: 4px 4px 0 var(--ink);
+  transition: transform 0.1s, box-shadow 0.1s, background 0.1s;
+}
+.newroom:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--ink); }
+.newroom:active {
+  background: var(--orange); color: var(--ink);
+  transform: translate(2px, 2px); box-shadow: 0 0 0 var(--ink);
+}
+
 /* Generic block */
 .block {
   border: 3px solid var(--ink);
