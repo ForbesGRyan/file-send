@@ -235,6 +235,12 @@ pub fn App() -> impl IntoView {
                         let link = format!("{}/#/room/{room}", public_origin());
                         set_qr.set(qr_svg(&link));
                         set_room_link.set(link);
+                        // Persist the room in the URL hash so a refresh rejoins the
+                        // same room instead of silently creating a brand-new one.
+                        let _ = web_sys::window()
+                            .unwrap()
+                            .location()
+                            .set_hash(&format!("/room/{room}"));
                         set_room_code.set(room);
                         set_status.set(Status::WaitingForPeer);
                     }
@@ -436,8 +442,11 @@ pub fn App() -> impl IntoView {
                 on:drop=on_drop
             >
                 <b>"Drop files here"</b>
-                <span class="sub">"— or click to choose —"</span>
-                <input type="file" multiple on:change=on_input_change />
+                <span class="sub">"— or —"</span>
+                <label class="filebtn">
+                    "Select files"
+                    <input type="file" multiple on:change=on_input_change />
+                </label>
             </div>
 
             <ProgressList

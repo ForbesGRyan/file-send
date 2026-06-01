@@ -163,7 +163,24 @@ button, input { -webkit-tap-highlight-color: transparent; }
   text-transform: uppercase; display: block; letter-spacing: -0.5px;
 }
 .drop .sub { font-family: "Space Mono", monospace; font-size: 11px; display: block; margin-top: 6px; }
-.drop input[type="file"] { margin-top: 14px; font-family: "Space Mono", monospace; font-size: 11px; }
+/* Themed file picker: hide the native control, drive it via a styled label. */
+.filebtn {
+  display: inline-block; margin-top: 16px; cursor: pointer;
+  border: 3px solid var(--ink); background: var(--ink); color: var(--paper);
+  font-family: "Archivo Black", sans-serif; font-size: 13px;
+  text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 22px;
+  box-shadow: 4px 4px 0 var(--ink);
+  transition: transform 0.1s, box-shadow 0.1s, background 0.1s;
+}
+.filebtn:hover { transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--ink); }
+.filebtn:active {
+  background: var(--orange); color: var(--ink);
+  transform: translate(2px, 2px); box-shadow: 0 0 0 var(--ink);
+}
+.filebtn input[type="file"] {
+  position: absolute; width: 1px; height: 1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
 
 /* Transfer rows */
 .progress-list { list-style: none; padding: 0; margin: 0; }

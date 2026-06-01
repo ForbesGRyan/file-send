@@ -1,6 +1,7 @@
 //! Leptos UI components.
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 /// Connection status shown to the user.
 #[derive(Clone, PartialEq)]
@@ -47,7 +48,7 @@ pub fn fmt_size(bytes: f64) -> String {
 }
 
 /// Lifecycle state of one transfer row.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TransferState {
     /// Incoming: awaiting the local user's accept/decline. Outgoing: awaiting the peer.
     Offered,
@@ -103,13 +104,16 @@ pub fn ProgressList(
             </button>
         </Show>
         <ul class="progress-list">
-            {move || {
-                items
-                    .get()
-                    .into_iter()
-                    .map(|t| transfer_row(t, on_accept, on_decline, on_cancel))
-                    .collect_view()
-            }}
+            <For
+                // Key on identity + lifecycle state, NOT fraction/speed. While a
+                // download is Active the key stays constant, so <For> keeps the
+                // row's DOM (and its Cancel button) alive across the hundreds of
+                // progress ticks instead of rebuilding the list each time. A button
+                // recreated mid-press eats the click — which is why Cancel was dead.
+                each=move || items.get()
+                key=|t| (t.id, t.incoming, t.state.clone())
+                children=move |t| transfer_row(t, items, on_accept, on_decline, on_cancel)
+            />
         </ul>
     }
 }
@@ -122,12 +126,13 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// Render one transfer row according to its state.
 fn transfer_row(
     t: Transfer,
+    items: ReadSignal<Vec<Transfer>>,
     on_accept: UnsyncCallback<u64>,
     on_decline: UnsyncCallback<u64>,
     on_cancel: UnsyncCallback<u64>,
 ) -> impl IntoView {
     let id = t.id;
-    let pct = (t.fraction * 100.0).round();
+    let incoming = t.incoming;
     let arrow = if t.incoming { "↓" } else { "↑" };
     match t.state {
         TransferState::Offered if t.incoming => view! {
@@ -179,13 +184,34 @@ fn transfer_row(
         TransferState::Active | TransferState::Done => {
             let done = t.state == TransferState::Done;
             let row_class = if done { "row done" } else { "row" };
-            let pct_label = if done { "✓ DONE".to_string() } else { format!("{pct}%") };
-            let bar_style = format!("width:{pct}%");
+            // This row's lifecycle state is fixed for its <For> key, so only the
+            // numbers move. Re-read fraction/speed live from the list on each tick
+            // via reactive closures: they update the bar/pct/speed in place without
+            // tearing down the row, keeping the Cancel button's DOM node stable.
+            let frac = move || {
+                items.with(|l| {
+                    l.iter()
+                        .find(|r| r.id == id && r.incoming == incoming)
+                        .map(|r| r.fraction)
+                        .unwrap_or(if done { 1.0 } else { 0.0 })
+                })
+            };
+            let speed = move || {
+                items.with(|l| {
+                    l.iter()
+                        .find(|r| r.id == id && r.incoming == incoming)
+                        .map(|r| r.speed)
+                        .unwrap_or(0.0)
+                })
+            };
+            let pct_label =
+                move || if done { "✓ DONE".to_string() } else { format!("{}%", (frac() * 100.0).round()) };
+            let bar_style = move || format!("width:{}%", (frac() * 100.0).round());
             // Live transfer rate, shown only while an incoming file is flowing.
-            let show_speed = t.incoming && !done && t.speed > 0.0;
-            let speed_label = fmt_speed(t.speed);
-            // Cancel is offered only on an in-progress download.
-            let show_cancel = t.incoming && !done;
+            let show_speed = move || incoming && !done && speed() > 0.0;
+            let speed_label = move || fmt_speed(speed());
+            // Cancel is offered only on an in-progress download (fixed per key).
+            let show_cancel = incoming && !done;
             view! {
                 <li class=row_class>
                     <div class="top">
@@ -195,10 +221,10 @@ fn transfer_row(
                             <span class="tag">{t.kind}</span>
                         </span>
                         <span class="meta">
-                            <Show when=move || show_speed>
-                                <span class="speed">{speed_label.clone()}</span>
+                            <Show when=show_speed>
+                                <span class="speed">{speed_label}</span>
                             </Show>
-                            <span class="pct">{pct_label.clone()}</span>
+                            <span class="pct">{pct_label}</span>
                             <Show when=move || show_cancel>
                                 <button class="cancel" on:click=move |_| on_cancel.run(id)>"Cancel"</button>
                             </Show>
@@ -212,12 +238,60 @@ fn transfer_row(
     }
 }
 
-/// Copy `text` to the clipboard, fire-and-forget (the returned Promise is
-/// intentionally ignored).
+/// Copy `text` to the clipboard.
+///
+/// The async Clipboard API (`navigator.clipboard`) only exists in secure
+/// contexts (HTTPS or `localhost`). When a peer opens the share link on another
+/// device over plain HTTP on the LAN, it is `undefined`, so we fall back to a
+/// transient off-screen `<textarea>` + the legacy `document.execCommand("copy")`,
+/// which works in non-secure contexts too.
 fn copy_to_clipboard(text: &str) {
-    if let Some(win) = web_sys::window() {
-        let _ = win.navigator().clipboard().write_text(text);
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let clipboard = win.navigator().clipboard();
+    let cb_val: wasm_bindgen::JsValue = clipboard.clone().into();
+    if cb_val.is_undefined() || cb_val.is_null() {
+        legacy_copy(&win, text);
+    } else {
+        // Fire-and-forget; the returned Promise is intentionally ignored.
+        let _ = clipboard.write_text(text);
     }
+}
+
+/// Synchronous clipboard copy for non-secure contexts, where
+/// `navigator.clipboard` is unavailable.
+fn legacy_copy(win: &web_sys::Window, text: &str) {
+    let Some(doc) = win.document() else {
+        return;
+    };
+    let Some(body) = doc.body() else {
+        return;
+    };
+    let Ok(area) = doc
+        .create_element("textarea")
+        .and_then(|el| {
+            el.dyn_into::<web_sys::HtmlTextAreaElement>()
+                .map_err(wasm_bindgen::JsValue::from)
+        })
+    else {
+        return;
+    };
+    area.set_value(text);
+    // Keep it off-screen so selecting it does not scroll or flash the page.
+    let _ = area.set_attribute(
+        "style",
+        "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;",
+    );
+    let _ = area.set_attribute("readonly", "");
+    if body.append_child(&area).is_err() {
+        return;
+    }
+    area.select();
+    if let Ok(html_doc) = doc.dyn_into::<web_sys::HtmlDocument>() {
+        let _ = html_doc.exec_command("copy");
+    }
+    let _ = body.remove_child(&area);
 }
 
 /// Share block: a prominent room code with a copy button and a QR code for
