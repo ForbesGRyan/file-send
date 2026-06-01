@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub enum SignalMsg {
     /// Client → server: create a fresh room. Server replies with `Created`.
     Create,
+    /// Client → server: re-create a room under a specific id. Sent by a tab that
+    /// created a room and is reloading (it remembers the id), so a refresh keeps the
+    /// same room/link instead of failing to re-join a room the server already tore
+    /// down. Server replies with `Created`; the reclaimer is again the initiator.
+    Reclaim { room: String },
     /// Server → client: a room was created with this id (creator is initiator).
     Created { room: String },
     /// Client → server: join an existing room by id.
@@ -38,6 +43,7 @@ mod tests {
     #[test]
     fn roundtrips_all_variants() {
         roundtrip(&SignalMsg::Create);
+        roundtrip(&SignalMsg::Reclaim { room: "abc".into() });
         roundtrip(&SignalMsg::Created { room: "abc".into() });
         roundtrip(&SignalMsg::Join { room: "abc".into() });
         roundtrip(&SignalMsg::PeerJoined);

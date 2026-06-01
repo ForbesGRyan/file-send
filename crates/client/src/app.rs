@@ -105,6 +105,28 @@ fn room_from_hash() -> Option<String> {
     if rest.is_empty() { None } else { Some(rest.to_string()) }
 }
 
+/// Key under which a tab records the room it created (so a refresh can reclaim it).
+const OWNS_KEY: &str = "file-send:owns";
+
+/// The browser's per-tab session storage, if available (absent in some privacy
+/// modes). Session storage — not local storage — because ownership is scoped to
+/// this tab and should not bleed into other tabs or survive the tab closing.
+fn session_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.session_storage().ok().flatten()
+}
+
+/// The room id this tab created, remembered across refreshes.
+fn session_owns() -> Option<String> {
+    session_storage()?.get_item(OWNS_KEY).ok().flatten()
+}
+
+/// Remember that this tab owns `room`, so a refresh reclaims it as the initiator.
+fn set_session_owns(room: &str) {
+    if let Some(s) = session_storage() {
+        let _ = s.set_item(OWNS_KEY, room);
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let (status, set_status) = signal(Status::Idle);
@@ -195,7 +217,17 @@ pub fn App() -> impl IntoView {
         let wire_ctrl = wire_ctrl.clone();
         let transfer = transfer.clone();
         Effect::new(move |_| {
-            let is_joiner = room_from_hash().is_some();
+            // Role for this load. A tab that created a room remembers its id in
+            // sessionStorage (which survives a refresh but not a fresh tab), so on
+            // reload the owner *reclaims* the same room instead of trying to join one
+            // the server already dropped. Both creating and reclaiming make us the
+            // initiator; only joining someone else's link makes us the joiner.
+            let hash_room = room_from_hash();
+            let reclaim = match (&hash_room, &session_owns()) {
+                (Some(h), Some(owned)) => h == owned,
+                _ => false,
+            };
+            let is_initiator = hash_room.is_none() || reclaim;
             set_status.set(Status::Connecting);
 
             let peer = match webrtc::new_peer_connection() {
@@ -222,9 +254,9 @@ pub fn App() -> impl IntoView {
                     }
                 });
             }
-            // Initiator creates the control channel up front; the joiner receives
-            // it via `ondatachannel` above.
-            if !is_joiner {
+            // Initiator (creator or reclaiming owner) creates the control channel up
+            // front; the joiner receives it via `ondatachannel` above.
+            if is_initiator {
                 let channel = webrtc::create_data_channel(&peer, crate::transfer::CTRL_LABEL);
                 wire_ctrl(peer.clone(), channel);
             }
@@ -241,11 +273,14 @@ pub fn App() -> impl IntoView {
                         set_qr.set(qr_svg(&link));
                         set_room_link.set(link);
                         // Persist the room in the URL hash so a refresh rejoins the
-                        // same room instead of silently creating a brand-new one.
+                        // same room instead of silently creating a brand-new one, and
+                        // remember (per tab) that we own it so the refresh reclaims it
+                        // rather than failing to join a torn-down room.
                         let _ = web_sys::window()
                             .unwrap()
                             .location()
                             .set_hash(&format!("/room/{room}"));
+                        set_session_owns(&room);
                         set_room_code.set(room);
                         set_status.set(Status::WaitingForPeer);
                     }
@@ -299,13 +334,13 @@ pub fn App() -> impl IntoView {
                 }
             });
 
-            // On open, either create the room or join it.
+            // On open: create a fresh room, reclaim our own room after a refresh, or
+            // join someone else's by id.
             let sig_open = signaling.clone();
-            signaling.on_open(move || {
-                match room_from_hash() {
-                    Some(room) => sig_open.send(&SignalMsg::Join { room }),
-                    None => sig_open.send(&SignalMsg::Create),
-                }
+            signaling.on_open(move || match room_from_hash() {
+                None => sig_open.send(&SignalMsg::Create),
+                Some(room) if reclaim => sig_open.send(&SignalMsg::Reclaim { room }),
+                Some(room) => sig_open.send(&SignalMsg::Join { room }),
             });
 
             *sig.borrow_mut() = Some(signaling);

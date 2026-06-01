@@ -55,6 +55,12 @@ impl RoomRegistry {
         }
     }
 
+    /// Does a live room with this id exist? (Rooms are dropped when empty, so this
+    /// is true only while some peer holds it.)
+    pub fn contains(&self, room_id: &str) -> bool {
+        self.rooms.contains_key(room_id)
+    }
+
     /// Return the other peer in `peer`'s room, if any.
     pub fn partner(&self, peer: PeerId) -> Option<PeerId> {
         let room_id = self.peer_room.get(&peer)?;

@@ -146,6 +146,30 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
                 state.send_to(peer, SignalMsg::Created { room });
             }
         }
+        // A reloading owner re-creates its room under the same id so its link keeps
+        // working. By the time the reload reconnects, the owner's previous socket has
+        // closed and its room has been dropped, so a legitimate reclaim always targets
+        // an *absent* id — which is no more privileged than `Create` with a chosen id.
+        // We therefore refuse to reclaim a room that currently exists: that would let
+        // anyone who guessed a code evict its occupants. The refusal is rate-limited
+        // and indistinguishable from a wrong code, so `Reclaim` leaks no more about
+        // which codes are live than `Join` already does.
+        SignalMsg::Reclaim { room } => {
+            let now = now_ms();
+            if !state.join_limiter.lock().unwrap().allowed(ip, now) {
+                state.send_to(peer, SignalMsg::RoomNotFound);
+                return;
+            }
+            if state.registry.lock().unwrap().contains(&room) {
+                state.join_limiter.lock().unwrap().record_failure(ip, now);
+                state.send_to(peer, SignalMsg::RoomNotFound);
+                return;
+            }
+            let outcome = state.registry.lock().unwrap().create(peer, room);
+            if let JoinOutcome::Created(room) = outcome {
+                state.send_to(peer, SignalMsg::Created { room });
+            }
+        }
         SignalMsg::Join { room } => {
             let now = now_ms();
             // Throttle enumeration: an IP over its recent failed-attempt budget
@@ -245,6 +269,41 @@ mod tests {
         assert!(matches!(rx2.try_recv().unwrap(), SignalMsg::Sdp { .. }));
         handle_message(&state, 2, ip(2), SignalMsg::Ice { candidate: "c".into() });
         assert!(matches!(rx1.try_recv().unwrap(), SignalMsg::Ice { .. }));
+    }
+
+    #[test]
+    fn reclaim_recreates_room_under_same_id_and_accepts_a_joiner() {
+        let state = AppState::new();
+        let mut rx1 = register(&state, 1);
+        // A reloading owner reclaims its known room id; server confirms with Created.
+        handle_message(&state, 1, ip(1), SignalMsg::Reclaim { room: "keepme".into() });
+        match rx1.try_recv().unwrap() {
+            SignalMsg::Created { room } => assert_eq!(room, "keepme"),
+            other => panic!("expected Created, got {other:?}"),
+        }
+        // The room is real again: a peer can join it and the owner is notified.
+        let _rx2 = register(&state, 2);
+        handle_message(&state, 2, ip(2), SignalMsg::Join { room: "keepme".into() });
+        assert!(matches!(rx1.try_recv().unwrap(), SignalMsg::PeerJoined));
+    }
+
+    #[test]
+    fn reclaim_cannot_displace_a_live_room() {
+        let state = AppState::new();
+        let mut rx1 = register(&state, 1);
+        handle_message(&state, 1, ip(1), SignalMsg::Create);
+        let room = match rx1.try_recv().unwrap() {
+            SignalMsg::Created { room } => room,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        // A stranger who guessed the code cannot reclaim (and thus evict) a live room.
+        let mut rx2 = register(&state, 2);
+        handle_message(&state, 2, ip(2), SignalMsg::Reclaim { room: room.clone() });
+        assert!(matches!(rx2.try_recv().unwrap(), SignalMsg::RoomNotFound));
+        // The original owner is untouched: a real joiner still reaches peer 1.
+        let _rx3 = register(&state, 3);
+        handle_message(&state, 3, ip(3), SignalMsg::Join { room });
+        assert!(matches!(rx1.try_recv().unwrap(), SignalMsg::PeerJoined));
     }
 
     #[test]

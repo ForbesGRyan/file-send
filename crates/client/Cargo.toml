@@ -30,6 +30,7 @@ features = [
   "RtcIceCandidate", "RtcIceCandidateInit",
   "Navigator", "Clipboard",
   "Performance",
+  "Storage",
 ]
 
 [dev-dependencies]
