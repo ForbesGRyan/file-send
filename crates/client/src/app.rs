@@ -217,57 +217,69 @@ pub fn App() -> impl IntoView {
         let wire_ctrl = wire_ctrl.clone();
         let transfer = transfer.clone();
         Effect::new(move |_| {
-            // Role for this load. A tab that created a room remembers its id in
-            // sessionStorage (which survives a refresh but not a fresh tab), so on
-            // reload the owner *reclaims* the same room instead of trying to join one
-            // the server already dropped. Both creating and reclaiming make us the
-            // initiator; only joining someone else's link makes us the joiner.
-            let hash_room = room_from_hash();
-            let reclaim = match (&hash_room, &session_owns()) {
-                (Some(h), Some(owned)) => h == owned,
-                _ => false,
-            };
-            let is_initiator = hash_room.is_none() || reclaim;
             set_status.set(Status::Connecting);
 
-            let peer = match webrtc::new_peer_connection() {
-                Ok(p) => p,
-                Err(e) => {
-                    set_status.set(Status::Error(format!("{e:?}")));
-                    return;
-                }
-            };
-            *pc.borrow_mut() = Some(peer.clone());
-
-            // Both peers listen for inbound channels: the control channel (joiner
-            // side) and per-file channels (whichever side is receiving a file).
-            // Channels are routed by label — `CTRL_LABEL` vs a numeric file id.
-            {
-                let wire = wire_ctrl.clone();
+            // Build a fresh peer connection, wire its inbound-channel and ICE
+            // handlers, store it as the current connection, and return it. A new one
+            // is built for each handshake, which is what lets a peer reconnect after
+            // a refresh instead of being stuck on a dead connection.
+            let build_pc: Rc<dyn Fn() -> Option<RtcPeerConnection>> = {
+                let pc = pc.clone();
+                let sig = sig.clone();
+                let wire_ctrl = wire_ctrl.clone();
                 let transfer = transfer.clone();
-                let peer_for_dc = peer.clone();
-                webrtc::on_data_channel(&peer, move |ch| {
-                    if ch.label() == crate::transfer::CTRL_LABEL {
-                        wire(peer_for_dc.clone(), ch);
-                    } else if let Some(t) = transfer.borrow().as_ref() {
-                        t.handle_incoming_channel(ch);
+                Rc::new(move || {
+                    let peer = match webrtc::new_peer_connection() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            set_status.set(Status::Error(format!("{e:?}")));
+                            return None;
+                        }
+                    };
+                    // Inbound channels routed by label: the control channel to
+                    // wire_ctrl, a per-file channel to the active transfer.
+                    {
+                        let wire = wire_ctrl.clone();
+                        let transfer = transfer.clone();
+                        let peer_for_dc = peer.clone();
+                        webrtc::on_data_channel(&peer, move |ch| {
+                            if ch.label() == crate::transfer::CTRL_LABEL {
+                                wire(peer_for_dc.clone(), ch);
+                            } else if let Some(t) = transfer.borrow().as_ref() {
+                                t.handle_incoming_channel(ch);
+                            }
+                        });
                     }
-                });
-            }
-            // Initiator (creator or reclaiming owner) creates the control channel up
-            // front; the joiner receives it via `ondatachannel` above.
-            if is_initiator {
-                let channel = webrtc::create_data_channel(&peer, crate::transfer::CTRL_LABEL);
-                wire_ctrl(peer.clone(), channel);
-            }
+                    // Forward locally-gathered ICE candidates out through signaling.
+                    {
+                        let sig_ice = sig.clone();
+                        webrtc::on_ice_candidate(&peer, move |candidate| {
+                            if let Some(s) = sig_ice.borrow().as_ref() {
+                                s.send(&SignalMsg::Ice { candidate });
+                            }
+                        });
+                    }
+                    *pc.borrow_mut() = Some(peer.clone());
+                    Some(peer)
+                })
+            };
 
-            // Build signaling; route inbound messages.
-            let pc_msg = peer.clone();
-            let sig_for_cb = sig.clone();
-            let signaling = match Signaling::connect(move |msg| {
-                let pc_msg = pc_msg.clone();
-                let sig_for_cb = sig_for_cb.clone();
-                match msg {
+            // Reclaim our own room at most once — only if a plain re-join finds it
+            // gone — so a failed reclaim can't loop.
+            let reclaim_tried = Rc::new(Cell::new(false));
+
+            // Build signaling; route inbound messages. Roles are dynamic: whoever is
+            // already in the room when the other (re)joins is told to offer
+            // (`PeerJoined`); the arriving side answers. Both build a fresh connection
+            // for the handshake.
+            let signaling = match Signaling::connect({
+                let build_pc = build_pc.clone();
+                let pc = pc.clone();
+                let sig_for_cb = sig.clone();
+                let wire_ctrl = wire_ctrl.clone();
+                let transfer = transfer.clone();
+                let reclaim_tried = reclaim_tried.clone();
+                move |msg| match msg {
                     SignalMsg::Created { room } => {
                         let link = format!("{}/#/room/{room}", public_origin());
                         set_qr.set(qr_svg(&link));
@@ -285,37 +297,79 @@ pub fn App() -> impl IntoView {
                         set_status.set(Status::WaitingForPeer);
                     }
                     SignalMsg::PeerJoined => {
-                        // Initiator: create and send the offer.
+                        // We were already here, so we offer: build a fresh connection
+                        // with its own control channel and send the offer.
+                        let Some(peer) = build_pc() else { return };
+                        let channel =
+                            webrtc::create_data_channel(&peer, crate::transfer::CTRL_LABEL);
+                        wire_ctrl(peer.clone(), channel);
+                        let sig_for_cb = sig_for_cb.clone();
                         spawn_local(async move {
-                            if let Ok(sdp) = webrtc::create_offer(&pc_msg).await {
+                            if let Ok(sdp) = webrtc::create_offer(&peer).await {
                                 if let Some(s) = sig_for_cb.borrow().as_ref() {
                                     s.send(&SignalMsg::Sdp { sdp, kind: "offer".into() });
                                 }
                             }
                         });
                     }
-                    SignalMsg::Sdp { sdp, kind } => {
+                    SignalMsg::Sdp { sdp, kind } if kind == "offer" => {
+                        // The other side offered: answer on a fresh connection.
+                        let Some(peer) = build_pc() else { return };
+                        let sig_for_cb = sig_for_cb.clone();
                         spawn_local(async move {
-                            if kind == "offer" {
-                                let _ = webrtc::set_remote(&pc_msg, RtcSdpType::Offer, &sdp).await;
-                                if let Ok(answer) = webrtc::create_answer(&pc_msg).await {
-                                    if let Some(s) = sig_for_cb.borrow().as_ref() {
-                                        s.send(&SignalMsg::Sdp { sdp: answer, kind: "answer".into() });
-                                    }
+                            let _ = webrtc::set_remote(&peer, RtcSdpType::Offer, &sdp).await;
+                            if let Ok(answer) = webrtc::create_answer(&peer).await {
+                                if let Some(s) = sig_for_cb.borrow().as_ref() {
+                                    s.send(&SignalMsg::Sdp { sdp: answer, kind: "answer".into() });
                                 }
-                            } else {
-                                let _ = webrtc::set_remote(&pc_msg, RtcSdpType::Answer, &sdp).await;
                             }
                         });
                     }
-                    SignalMsg::Ice { candidate } => {
-                        spawn_local(async move {
-                            let _ = webrtc::add_ice_candidate(&pc_msg, &candidate).await;
-                        });
+                    SignalMsg::Sdp { sdp, .. } => {
+                        // An answer to the offer we sent.
+                        if let Some(peer) = pc.borrow().clone() {
+                            spawn_local(async move {
+                                let _ = webrtc::set_remote(&peer, RtcSdpType::Answer, &sdp).await;
+                            });
+                        }
                     }
-                    SignalMsg::PeerLeft => set_status.set(Status::PeerLeft),
+                    SignalMsg::Ice { candidate } => {
+                        if let Some(peer) = pc.borrow().clone() {
+                            spawn_local(async move {
+                                let _ = webrtc::add_ice_candidate(&peer, &candidate).await;
+                            });
+                        }
+                    }
+                    SignalMsg::PeerLeft => {
+                        // The partner vanished (perhaps mid-refresh). Drop the stale
+                        // connection so a reconnect starts clean; if they come back the
+                        // server re-sends PeerJoined / an offer and we re-handshake.
+                        if let Some(peer) = pc.borrow_mut().take() {
+                            peer.close();
+                        }
+                        *transfer.borrow_mut() = None;
+                        set_status.set(Status::PeerLeft);
+                    }
                     SignalMsg::RoomFull => set_status.set(Status::RoomFull),
-                    SignalMsg::RoomNotFound => set_status.set(Status::RoomNotFound),
+                    SignalMsg::RoomNotFound => {
+                        // A re-join found the room gone. If we own it, recreate it once
+                        // (a reload while we were the only peer); otherwise it is
+                        // genuinely unavailable.
+                        let owns = matches!(
+                            (room_from_hash(), session_owns()),
+                            (Some(h), Some(o)) if h == o
+                        );
+                        if owns && !reclaim_tried.get() {
+                            reclaim_tried.set(true);
+                            if let (Some(room), Some(s)) =
+                                (room_from_hash(), sig_for_cb.borrow().as_ref())
+                            {
+                                s.send(&SignalMsg::Reclaim { room });
+                            }
+                        } else {
+                            set_status.set(Status::RoomNotFound);
+                        }
+                    }
                     _ => {}
                 }
             }) {
@@ -326,20 +380,13 @@ pub fn App() -> impl IntoView {
                 }
             };
 
-            // Forward local ICE candidates out through signaling.
-            let sig_ice = sig.clone();
-            webrtc::on_ice_candidate(&peer, move |candidate| {
-                if let Some(s) = sig_ice.borrow().as_ref() {
-                    s.send(&SignalMsg::Ice { candidate });
-                }
-            });
-
-            // On open: create a fresh room, reclaim our own room after a refresh, or
-            // join someone else's by id.
+            // On open: create a fresh room (no code in the URL) or (re)join the room
+            // in the URL. A reload always tries to re-join first — reconnecting to a
+            // partner who is still there — and only recreates the room if that join
+            // finds it gone (handled in RoomNotFound above).
             let sig_open = signaling.clone();
             signaling.on_open(move || match room_from_hash() {
                 None => sig_open.send(&SignalMsg::Create),
-                Some(room) if reclaim => sig_open.send(&SignalMsg::Reclaim { room }),
                 Some(room) => sig_open.send(&SignalMsg::Join { room }),
             });
 
