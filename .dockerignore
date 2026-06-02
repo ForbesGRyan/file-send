@@ -1,0 +1,8 @@
+target/
+crates/client/dist/
+.git/
+docs/
+*.txt
+README.md
+Dockerfile
+.dockerignore
