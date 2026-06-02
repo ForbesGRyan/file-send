@@ -32,6 +32,30 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Diagnostic signaling log to stderr. Temporary instrumentation for the
+/// sleep/reconnect investigation: traces every connection-lifecycle boundary so
+/// one reproduction reveals which layer fails (socket close detected? PeerLeft
+/// delivered? does the woken peer ever re-Join?). Remove once root cause is fixed.
+fn sig_log(peer: PeerId, what: impl std::fmt::Display) {
+    eprintln!("[sig t={} peer={peer}] {what}", now_ms());
+}
+
+/// Short tag for a message variant, for logging without consuming the message.
+fn msg_kind(msg: &SignalMsg) -> &'static str {
+    match msg {
+        SignalMsg::Create => "Create",
+        SignalMsg::Reclaim { .. } => "Reclaim",
+        SignalMsg::Created { .. } => "Created",
+        SignalMsg::Join { .. } => "Join",
+        SignalMsg::PeerJoined => "PeerJoined",
+        SignalMsg::PeerLeft => "PeerLeft",
+        SignalMsg::RoomFull => "RoomFull",
+        SignalMsg::RoomNotFound => "RoomNotFound",
+        SignalMsg::Sdp { .. } => "Sdp",
+        SignalMsg::Ice { .. } => "Ice",
+    }
+}
+
 /// Shared application state, cloned cheaply (Arc) into every handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -81,6 +105,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
     use futures_util::{SinkExt, StreamExt};
 
     let peer_id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    sig_log(peer_id, format_args!("+connect ip={ip}"));
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalMsg>();
     state.senders.lock().unwrap().insert(peer_id, tx);
@@ -105,6 +130,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
                 };
                 handle_message(&recv_state, peer_id, ip, parsed);
             } else if let Message::Close(_) = msg {
+                sig_log(peer_id, "recv close-frame");
                 break;
             }
         }
@@ -117,8 +143,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
 
     // Cleanup on disconnect: notify partner, drop from registry + senders.
     let partner = state.registry.lock().unwrap().remove(peer_id);
-    if let Some(partner) = partner {
-        state.send_to(partner, SignalMsg::PeerLeft);
+    match partner {
+        Some(partner) => {
+            sig_log(peer_id, format_args!("+disconnect; notify PeerLeft -> peer={partner}"));
+            state.send_to(partner, SignalMsg::PeerLeft);
+        }
+        None => sig_log(peer_id, "+disconnect; no partner to notify"),
     }
     state.senders.lock().unwrap().remove(&peer_id);
 }
@@ -138,11 +168,13 @@ fn gen_room_id() -> String {
 /// Apply one inbound signaling message. `ip` is the peer's source address, used
 /// to rate-limit join attempts.
 fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
+    sig_log(peer, format_args!("recv {}", msg_kind(&msg)));
     match msg {
         SignalMsg::Create => {
             let room_id = gen_room_id();
             let outcome = state.registry.lock().unwrap().create(peer, room_id);
             if let JoinOutcome::Created(room) = outcome {
+                sig_log(peer, format_args!("created room={room}"));
                 state.send_to(peer, SignalMsg::Created { room });
             }
         }
@@ -157,16 +189,19 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
         SignalMsg::Reclaim { room } => {
             let now = now_ms();
             if !state.join_limiter.lock().unwrap().allowed(ip, now) {
+                sig_log(peer, format_args!("reclaim room={room} -> rate-limited -> RoomNotFound"));
                 state.send_to(peer, SignalMsg::RoomNotFound);
                 return;
             }
             if state.registry.lock().unwrap().contains(&room) {
+                sig_log(peer, format_args!("reclaim room={room} -> still live, refused -> RoomNotFound"));
                 state.join_limiter.lock().unwrap().record_failure(ip, now);
                 state.send_to(peer, SignalMsg::RoomNotFound);
                 return;
             }
             let outcome = state.registry.lock().unwrap().create(peer, room);
             if let JoinOutcome::Created(room) = outcome {
+                sig_log(peer, format_args!("reclaimed room={room}"));
                 state.send_to(peer, SignalMsg::Created { room });
             }
         }
@@ -181,16 +216,23 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
             let outcome = state.registry.lock().unwrap().join(peer, &room);
             match outcome {
                 JoinOutcome::Joined => {
+                    let members = state.registry.lock().unwrap().debug_room_of(peer);
+                    sig_log(peer, format_args!("join room={room} -> Joined; members={members:?}"));
                     // Tell the initiator (the partner) to start the WebRTC offer.
                     if let Some(partner) = state.registry.lock().unwrap().partner(peer) {
+                        sig_log(peer, format_args!("notify PeerJoined -> peer={partner}"));
                         state.send_to(partner, SignalMsg::PeerJoined);
+                    } else {
+                        sig_log(peer, "join Joined but no partner found (?)");
                     }
                 }
                 JoinOutcome::Full => {
+                    sig_log(peer, format_args!("join room={room} -> Full"));
                     state.join_limiter.lock().unwrap().record_failure(ip, now);
                     state.send_to(peer, SignalMsg::RoomFull);
                 }
                 JoinOutcome::NotFound => {
+                    sig_log(peer, format_args!("join room={room} -> NotFound"));
                     state.join_limiter.lock().unwrap().record_failure(ip, now);
                     state.send_to(peer, SignalMsg::RoomNotFound);
                 }
@@ -199,9 +241,14 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
         }
         // Relay SDP and ICE verbatim to the partner.
         relay @ (SignalMsg::Sdp { .. } | SignalMsg::Ice { .. }) => {
+            let kind = msg_kind(&relay);
             let partner = state.registry.lock().unwrap().partner(peer);
-            if let Some(partner) = partner {
-                state.send_to(partner, relay);
+            match partner {
+                Some(partner) => {
+                    sig_log(peer, format_args!("relay {kind} -> peer={partner}"));
+                    state.send_to(partner, relay);
+                }
+                None => sig_log(peer, format_args!("relay {kind} dropped: no partner")),
             }
         }
         // Server-originated variants are ignored if received from a client.

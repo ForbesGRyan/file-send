@@ -87,6 +87,14 @@ impl RoomRegistry {
     fn room_count(&self) -> usize {
         self.rooms.len()
     }
+
+    /// Debug snapshot: the room a peer is in and that room's current members.
+    /// Used only by diagnostic logging in `ws.rs`.
+    pub fn debug_room_of(&self, peer: PeerId) -> Option<(String, Vec<PeerId>)> {
+        let room_id = self.peer_room.get(&peer)?;
+        let members = self.rooms.get(room_id)?.peers.clone();
+        Some((room_id.clone(), members))
+    }
 }
 
 #[cfg(test)]
