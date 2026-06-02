@@ -64,6 +64,8 @@ pub struct Handlers {
     pub on_rejected: Rc<dyn Fn(u64)>,
     /// Outgoing file `id` was cancelled mid-transfer by the peer.
     pub on_cancelled: Rc<dyn Fn(u64)>,
+    /// Incoming file `id` was aborted by the sender; discard the partial download.
+    pub on_aborted: Rc<dyn Fn(u64)>,
 }
 
 /// State shared between the control router, per-file receive routers, and the
@@ -140,6 +142,14 @@ impl Transfer {
         self.shared.incoming.borrow_mut().remove(&id);
     }
 
+    /// Abort the in-progress outgoing file `id` (sender-initiated): flag it so the
+    /// streaming task stops (and closes its channel), and tell the receiver to
+    /// discard the partial download. The mirror of [`cancel`] for the send side.
+    pub fn abort(&self, id: u64) {
+        cancel_outgoing(&mut self.shared.outgoing.borrow_mut(), id);
+        let _ = self.shared.ctrl.send_with_str(&encode_control(&Control::Abort { id }));
+    }
+
     /// Set the control channel's `onopen` handler (takes ownership of the closure).
     pub fn channel_set_onopen(&self, cb: wasm_bindgen::closure::Closure<dyn FnMut()>) {
         self.shared.ctrl.set_onopen(Some(cb.as_ref().unchecked_ref()));
@@ -179,6 +189,12 @@ fn install_ctrl_router(shared: &Rc<Shared>) {
             Some(Control::Cancel { id }) => {
                 cancel_outgoing(&mut shared.outgoing.borrow_mut(), id);
                 (shared.handlers.on_cancelled)(id);
+            }
+            Some(Control::Abort { id }) => {
+                // The sender aborted a file it was streaming to us: drop the
+                // partial download so any late chunk is ignored, then mark the row.
+                shared.incoming.borrow_mut().remove(&id);
+                (shared.handlers.on_aborted)(id);
             }
             // Start/End never travel on the control channel.
             _ => {}

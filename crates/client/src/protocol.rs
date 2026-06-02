@@ -48,6 +48,11 @@ pub enum Control {
     End(FileEnd),
     /// Receiver aborts an in-progress file `id`; the sender stops streaming it.
     Cancel { id: u64 },
+    /// Sender aborts an in-progress file `id` it is streaming; the receiver
+    /// discards the partial download. Kept distinct from `Cancel`
+    /// (receiver→sender) so the direction is unambiguous even when the two
+    /// peers' id spaces overlap.
+    Abort { id: u64 },
 }
 
 /// Encode a control frame to a JSON string (sent as a text data-channel message).
@@ -132,6 +137,22 @@ mod tests {
     fn control_roundtrip_cancel() {
         let c = Control::Cancel { id: 8 };
         assert_eq!(decode_control(&encode_control(&c)), Some(c));
+    }
+
+    #[test]
+    fn control_roundtrip_abort() {
+        let c = Control::Abort { id: 8 };
+        assert_eq!(decode_control(&encode_control(&c)), Some(c));
+    }
+
+    #[test]
+    fn cancel_and_abort_are_distinct_on_the_wire() {
+        // Same id, opposite directions: the encodings must differ so a peer can
+        // tell "stop sending me X" from "I'm aborting X I send you".
+        assert_ne!(
+            encode_control(&Control::Cancel { id: 8 }),
+            encode_control(&Control::Abort { id: 8 })
+        );
     }
 
     #[test]

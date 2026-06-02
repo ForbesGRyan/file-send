@@ -170,6 +170,10 @@ pub fn App() -> impl IntoView {
         on_cancelled: Rc::new(move |id| {
             set_items.update(|list| rows::mark_cancelled_remote(list, id));
         }),
+        on_aborted: Rc::new(move |id| {
+            // The sender aborted a file we were receiving: mark the incoming row.
+            set_items.update(|list| rows::cancel(list, id));
+        }),
     };
 
     // Send offers for a batch of already-id'd files (their Pending rows already
@@ -456,6 +460,17 @@ pub fn App() -> impl IntoView {
             set_items.update(|list| rows::cancel(list, id));
         }
     };
+    // Cancel an in-progress outgoing send: stop streaming, tell the peer to
+    // discard it, mark our own row. Mirror of `on_cancel` for the send side.
+    let on_cancel_send = {
+        let transfer = transfer.clone();
+        move |id: u64| {
+            if let Some(t) = transfer.borrow().as_ref() {
+                t.abort(id);
+            }
+            set_items.update(|list| rows::mark_cancelled_remote(list, id));
+        }
+    };
     let on_accept_all = {
         let transfer = transfer.clone();
         move || {
@@ -566,6 +581,7 @@ pub fn App() -> impl IntoView {
                 on_accept=UnsyncCallback::new(on_accept)
                 on_decline=UnsyncCallback::new(on_decline)
                 on_cancel=UnsyncCallback::new(on_cancel)
+                on_cancel_send=UnsyncCallback::new(on_cancel_send)
                 on_accept_all=UnsyncCallback::new(move |_| on_accept_all())
             />
         </main>

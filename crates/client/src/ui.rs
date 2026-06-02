@@ -95,6 +95,7 @@ pub fn ProgressList(
     on_accept: UnsyncCallback<u64>,
     on_decline: UnsyncCallback<u64>,
     on_cancel: UnsyncCallback<u64>,
+    on_cancel_send: UnsyncCallback<u64>,
     on_accept_all: UnsyncCallback<()>,
 ) -> impl IntoView {
     // Show "Accept all" only when 2+ incoming offers are pending.
@@ -116,7 +117,7 @@ pub fn ProgressList(
                 // recreated mid-press eats the click — which is why Cancel was dead.
                 each=move || items.get()
                 key=|t| (t.id, t.incoming, t.state.clone())
-                children=move |t| transfer_row(t, items, on_accept, on_decline, on_cancel)
+                children=move |t| transfer_row(t, items, on_accept, on_decline, on_cancel, on_cancel_send)
             />
         </ul>
     }
@@ -134,6 +135,7 @@ fn transfer_row(
     on_accept: UnsyncCallback<u64>,
     on_decline: UnsyncCallback<u64>,
     on_cancel: UnsyncCallback<u64>,
+    on_cancel_send: UnsyncCallback<u64>,
 ) -> impl IntoView {
     let id = t.id;
     let incoming = t.incoming;
@@ -229,8 +231,9 @@ fn transfer_row(
             // Live transfer rate, shown only while an incoming file is flowing.
             let show_speed = move || incoming && !done && speed() > 0.0;
             let speed_label = move || fmt_speed(speed());
-            // Cancel is offered only on an in-progress download (fixed per key).
-            let show_cancel = incoming && !done;
+            // Cancel is offered on any in-progress transfer — a download (receiver)
+            // or an upload (sender) — but not once it's Done (fixed per key).
+            let show_cancel = !done;
             view! {
                 <li class=row_class>
                     <div class="top">
@@ -245,7 +248,10 @@ fn transfer_row(
                             </Show>
                             <span class="pct">{pct_label}</span>
                             <Show when=move || show_cancel>
-                                <button class="cancel" on:click=move |_| on_cancel.run(id)>"Cancel"</button>
+                                <button
+                                    class="cancel"
+                                    on:click=move |_| if incoming { on_cancel.run(id) } else { on_cancel_send.run(id) }
+                                >"Cancel"</button>
                             </Show>
                         </span>
                     </div>
