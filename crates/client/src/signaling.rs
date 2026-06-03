@@ -7,6 +7,20 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{MessageEvent, WebSocket};
 
+/// Base reconnect delay in ms; doubles each attempt up to `BACKOFF_CAP_MS`.
+const BACKOFF_BASE_MS: u32 = 500;
+/// Maximum reconnect delay in ms.
+const BACKOFF_CAP_MS: u32 = 15_000;
+
+/// Reconnect delay for the Nth consecutive attempt (0-based): exponential
+/// backoff `500 * 2^attempt`, capped at 15s. Pure, for unit testing and so the
+/// reconnect timer and any future caller share one definition. Uses `u64`
+/// internally so a large `attempt` saturates to the cap instead of overflowing.
+pub fn next_backoff(attempt: u32) -> u32 {
+    let shifted = (BACKOFF_BASE_MS as u64).checked_shl(attempt).unwrap_or(u64::MAX);
+    shifted.min(BACKOFF_CAP_MS as u64) as u32
+}
+
 /// Owns a browser WebSocket and routes inbound `SignalMsg`s to a callback.
 #[derive(Clone)]
 pub struct Signaling {
@@ -51,5 +65,26 @@ impl Signaling {
         let cb = Closure::<dyn FnMut()>::new(move || f());
         self.ws.set_onopen(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_backoff;
+
+    #[test]
+    fn backoff_ramps_then_caps() {
+        // 500 * 2^attempt, capped at 15_000 ms.
+        assert_eq!(next_backoff(0), 500);
+        assert_eq!(next_backoff(1), 1_000);
+        assert_eq!(next_backoff(2), 2_000);
+        assert_eq!(next_backoff(3), 4_000);
+        assert_eq!(next_backoff(4), 8_000);
+        // 500 * 2^5 = 16_000 -> capped.
+        assert_eq!(next_backoff(5), 15_000);
+        assert_eq!(next_backoff(6), 15_000);
+        // Large attempts never overflow or drop below the cap.
+        assert_eq!(next_backoff(40), 15_000);
+        assert_eq!(next_backoff(100), 15_000);
     }
 }
