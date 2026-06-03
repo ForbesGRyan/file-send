@@ -113,8 +113,17 @@ pub fn step(s: &mut Session, ev: Event) -> Vec<Action> {
             s.has_pc = false;
             vec![Action::TeardownPc, Action::SetStatus(Status::PeerLeft)]
         }
-        // Created / RoomFull / RoomNotFound are added in later tasks.
-        _ => vec![],
+        Event::Created { room } => {
+            s.owns = Some(room.clone());
+            s.room_in_hash = Some(room.clone());
+            vec![
+                Action::PersistRoom { room },
+                Action::SetStatus(Status::WaitingForPeer),
+            ]
+        }
+        Event::RoomFull => vec![Action::SetStatus(Status::RoomFull)],
+        // RoomNotFound is added in Task 4.
+        Event::RoomNotFound => vec![],
     }
 }
 
@@ -182,5 +191,30 @@ mod tests {
             vec![Action::TeardownPc, Action::SetStatus(Status::PeerLeft)]
         );
         assert!(!s.has_pc, "pc cleared so a reconnect starts clean");
+    }
+
+    #[test]
+    fn created_persists_room_and_waits() {
+        let mut s = Session::default();
+        assert_eq!(
+            step(&mut s, Event::Created { room: "abc23".into() }),
+            vec![
+                Action::PersistRoom { room: "abc23".into() },
+                Action::SetStatus(Status::WaitingForPeer),
+            ]
+        );
+        // The created room is now both owned and the hash room (so a later
+        // RoomNotFound can reclaim it).
+        assert_eq!(s.owns.as_deref(), Some("abc23"));
+        assert_eq!(s.room_in_hash.as_deref(), Some("abc23"));
+    }
+
+    #[test]
+    fn room_full_sets_status() {
+        let mut s = Session::default();
+        assert_eq!(
+            step(&mut s, Event::RoomFull),
+            vec![Action::SetStatus(Status::RoomFull)]
+        );
     }
 }
