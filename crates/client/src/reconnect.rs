@@ -48,7 +48,12 @@ pub struct Session {
     pub owns: Option<String>,
     /// Whether a reclaim has already been attempted this session (reclaim at most once).
     pub reclaim_tried: bool,
-    /// Whether a live peer connection currently exists.
+    /// Whether a peer connection has been built for this handshake. This tracks
+    /// *intent to build* (set when the reducer emits `BuildPcAndOffer`/
+    /// `BuildPcAndAnswer`), not a guarantee the build succeeded — `app.rs` may
+    /// fail to construct the `RtcPeerConnection`, so the execute side still
+    /// re-checks for a live `pc` before using it. Used here only to drop stray
+    /// `Answer`/`Ice` that arrive before any handshake has started.
     pub has_pc: bool,
 }
 
