@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known gap: receiver does not validate FileEnd.id against the open file"]
+    #[ignore = "known gap: receiver does not validate FileEnd.id; implement the id check in finalize_decision_checked"]
     fn finalize_rejects_mismatched_id() {
         let mut inc = incoming_with(meta(7));
         // A FileEnd for a different id must not finalize this file.
@@ -253,6 +253,7 @@ mod tests {
         let mut inc = incoming_with(meta(7));
         let m = finalize_decision_checked(&mut inc, 7).unwrap();
         assert_eq!(m.id, 7);
+        assert!(inc.meta.is_none(), "meta must be consumed on a match");
     }
 
     // --- rolling-window speed estimate ---
