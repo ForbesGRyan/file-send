@@ -282,5 +282,17 @@ mod tests {
             step(&mut s, Event::RoomNotFound),
             vec![Action::SetStatus(Status::RoomNotFound)]
         );
+        assert!(!s.reclaim_tried, "owning a different room must not set the reclaim flag");
+    }
+
+    #[test]
+    fn no_hash_no_owns_does_not_reclaim() {
+        // Bare session (no room in URL, owns nothing) must never reclaim.
+        let mut s = Session::default();
+        assert_eq!(
+            step(&mut s, Event::RoomNotFound),
+            vec![Action::SetStatus(Status::RoomNotFound)]
+        );
+        assert!(!s.reclaim_tried);
     }
 }
