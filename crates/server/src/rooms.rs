@@ -75,6 +75,8 @@ impl RoomRegistry {
 
     /// Remove rooms that have sat idle (a single waiting peer, no activity) for at
     /// least `ttl_ms`, returning the ids removed so the caller can notify/clean up.
+    /// Rooms with two peers are active and are never reaped — only single-peer
+    /// idle rooms expire.
     ///
     /// NOTE (known gap): not yet implemented — returns nothing, so idle rooms never
     /// expire. The `#[ignore]`d test `reap_idle_expires_lonely_room` pins the
@@ -109,6 +111,12 @@ impl RoomRegistry {
     #[cfg(test)]
     fn room_count(&self) -> usize {
         self.rooms.len()
+    }
+
+    /// Test-only: read a room's recorded last-activity timestamp.
+    #[cfg(test)]
+    fn last_activity_of(&self, room_id: &str) -> Option<u64> {
+        self.rooms.get(room_id).map(|r| r.last_activity_ms)
     }
 
     /// Debug snapshot: the room a peer is in and that room's current members.
@@ -171,10 +179,16 @@ mod tests {
         let mut r = RoomRegistry::new();
         // A peer creates a room at t=0 and is left waiting alone.
         r.create(1, "lonely".into(), 0);
-        // 60s later, with a 30s TTL, the idle room should be reaped.
+        // A separate room with two peers is active and must survive.
+        r.create(2, "paired".into(), 0);
+        r.join(3, "paired", 0);
+        // 60s later, with a 30s TTL, the idle single-peer room should be reaped,
+        // but the paired room must not be.
         let reaped = r.reap_idle(60_000, 30_000);
         assert_eq!(reaped, vec!["lonely".to_string()]);
         assert!(!r.contains("lonely"), "expired room must be gone");
+        assert!(r.contains("paired"), "active paired room must survive");
+        assert!(!reaped.contains(&"paired".to_string()), "paired room must not be reaped");
     }
 
     #[test]
@@ -184,5 +198,7 @@ mod tests {
         r.touch("live", 5_000);
         r.touch("ghost", 5_000); // no-op, must not panic
         assert!(r.contains("live"));
+        assert_eq!(r.last_activity_of("live"), Some(5_000), "touch must record the timestamp");
+        assert_eq!(r.last_activity_of("ghost"), None, "touching a missing room creates nothing");
     }
 }

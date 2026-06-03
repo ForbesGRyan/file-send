@@ -199,7 +199,7 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
                 state.send_to(peer, SignalMsg::RoomNotFound);
                 return;
             }
-            let outcome = state.registry.lock().unwrap().create(peer, room, now_ms());
+            let outcome = state.registry.lock().unwrap().create(peer, room, now);
             if let JoinOutcome::Created(room) = outcome {
                 sig_log(peer, format_args!("reclaimed room={room}"));
                 state.send_to(peer, SignalMsg::Created { room });
