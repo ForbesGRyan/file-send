@@ -43,7 +43,9 @@ struct SignalingInner {
     on_disconnect: RefCell<Option<Rc<dyn Fn()>>>,
     /// Consecutive failed-reconnect counter; reset to 0 on a successful open.
     attempt: Cell<u32>,
-    /// Set before an intentional close so `onclose` does not reconnect.
+    /// Set before an intentional close so `onclose` does not reconnect. No
+    /// setter yet — the app has no intentional-close path (tab close is handled
+    /// by the browser), so this is always `false` today; reserved for one.
     closed: Cell<bool>,
     callbacks: RefCell<Option<SocketCallbacks>>,
     _online: RefCell<Option<Closure<dyn FnMut()>>>,
