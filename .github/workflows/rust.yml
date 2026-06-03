@@ -21,6 +21,18 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  ignored-backlog:
+    # The marked-failing "crack-finder" tests: known gaps with no fix yet.
+    # Non-blocking — a failure here is expected and informational. When one of
+    # these starts PASSING, the underlying bug is fixed and its #[ignore] should
+    # be removed so it joins the required `build` gate.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v6
+    - name: Run marked-failing backlog
+      run: cargo test --verbose -- --ignored
+
   docker:
     needs: build
     if: github.event_name == 'push'
