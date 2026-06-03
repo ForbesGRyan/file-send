@@ -3,6 +3,7 @@ mod filetype;
 mod log;
 mod protocol;
 mod qr;
+mod reconnect;
 mod rows;
 mod signaling;
 mod transfer;
