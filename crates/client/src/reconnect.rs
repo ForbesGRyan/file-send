@@ -25,6 +25,10 @@ pub enum Event {
     /// We received an SDP answer to the offer we sent.
     Answer { sdp: String },
     /// We received an ICE candidate.
+    ///
+    /// The candidate string is not carried here; `app.rs` stashes it before
+    /// calling `step`, and `Action::AddIce` consumes it from that stash. This
+    /// keeps the reducer payload-free for events that carry no routing decision.
     Ice,
     /// The partner left/disconnected.
     PeerLeft,
@@ -83,7 +87,33 @@ pub fn step(s: &mut Session, ev: Event) -> Vec<Action> {
             // A fresh visit creates a new room.
             None => vec![Action::SendCreate],
         },
-        // Remaining variants are added in later tasks.
+        Event::PeerJoined => {
+            s.has_pc = true;
+            vec![Action::BuildPcAndOffer]
+        }
+        Event::Offer { sdp } => {
+            s.has_pc = true;
+            vec![Action::BuildPcAndAnswer { sdp }]
+        }
+        Event::Answer { sdp } => {
+            if s.has_pc {
+                vec![Action::SetRemoteAnswer { sdp }]
+            } else {
+                vec![]
+            }
+        }
+        Event::Ice => {
+            if s.has_pc {
+                vec![Action::AddIce]
+            } else {
+                vec![]
+            }
+        }
+        Event::PeerLeft => {
+            s.has_pc = false;
+            vec![Action::TeardownPc, Action::SetStatus(Status::PeerLeft)]
+        }
+        // Created / RoomFull / RoomNotFound are added in later tasks.
         _ => vec![],
     }
 }
@@ -105,5 +135,52 @@ mod tests {
             step(&mut s, Event::Open),
             vec![Action::SendJoin { room: "k7m4qp".into() }]
         );
+    }
+
+    #[test]
+    fn peer_joined_builds_pc_and_offers() {
+        let mut s = Session::default();
+        assert_eq!(step(&mut s, Event::PeerJoined), vec![Action::BuildPcAndOffer]);
+        assert!(s.has_pc, "offering side now has a live pc");
+    }
+
+    #[test]
+    fn offer_builds_pc_and_answers() {
+        let mut s = Session::default();
+        assert_eq!(
+            step(&mut s, Event::Offer { sdp: "OFFER".into() }),
+            vec![Action::BuildPcAndAnswer { sdp: "OFFER".into() }]
+        );
+        assert!(s.has_pc, "answering side now has a live pc");
+    }
+
+    #[test]
+    fn answer_sets_remote_only_when_a_pc_exists() {
+        let mut s = Session { has_pc: true, ..Session::default() };
+        assert_eq!(
+            step(&mut s, Event::Answer { sdp: "ANS".into() }),
+            vec![Action::SetRemoteAnswer { sdp: "ANS".into() }]
+        );
+        // Without a pc, a stray answer is ignored (today's "recv answer but no pc").
+        let mut empty = Session::default();
+        assert_eq!(step(&mut empty, Event::Answer { sdp: "ANS".into() }), vec![]);
+    }
+
+    #[test]
+    fn ice_added_only_when_a_pc_exists() {
+        let mut s = Session { has_pc: true, ..Session::default() };
+        assert_eq!(step(&mut s, Event::Ice), vec![Action::AddIce]);
+        let mut empty = Session::default();
+        assert_eq!(step(&mut empty, Event::Ice), vec![]);
+    }
+
+    #[test]
+    fn peer_left_tears_down_and_clears_pc() {
+        let mut s = Session { has_pc: true, ..Session::default() };
+        assert_eq!(
+            step(&mut s, Event::PeerLeft),
+            vec![Action::TeardownPc, Action::SetStatus(Status::PeerLeft)]
+        );
+        assert!(!s.has_pc, "pc cleared so a reconnect starts clean");
     }
 }
