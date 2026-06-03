@@ -97,6 +97,19 @@ pub(crate) fn finalize_decision(inc: &mut Incoming) -> Option<FileStart> {
     inc.meta.take()
 }
 
+/// Receiver: consume the incoming state at end-of-file, validating that the
+/// `FileEnd.id` matches the file currently open. Returns the meta to save only
+/// on a match; a mismatch means a protocol desync (e.g. a future bidirectional/
+/// parallel mode crossing id spaces) and must NOT save bytes under the wrong id.
+///
+/// NOTE (known gap): this currently ignores `end_id` and behaves like
+/// `finalize_decision`. The `#[ignore]`d test `finalize_rejects_mismatched_id`
+/// pins the target behavior; implement the id check to make it pass.
+#[allow(dead_code)]
+pub(crate) fn finalize_decision_checked(inc: &mut Incoming, _end_id: u64) -> Option<FileStart> {
+    inc.meta.take()
+}
+
 /// Fold `len` new bytes into the rolling-window speed estimate. The window
 /// closes every ~250ms, smoothing out per-chunk jitter into a stable rate.
 fn update_speed(inc: &mut Incoming, len: f64, now: f64) {
@@ -223,6 +236,24 @@ mod tests {
     fn finalize_decision_with_no_transfer_is_none() {
         let mut inc = Incoming::default();
         assert!(finalize_decision(&mut inc).is_none());
+    }
+
+    #[test]
+    #[ignore = "known gap: receiver does not validate FileEnd.id; implement the id check in finalize_decision_checked"]
+    fn finalize_rejects_mismatched_id() {
+        let mut inc = incoming_with(meta(7));
+        // A FileEnd for a different id must not finalize this file.
+        assert!(finalize_decision_checked(&mut inc, 999).is_none());
+        // The open file's meta must remain available for a correct End.
+        assert!(inc.meta.is_some());
+    }
+
+    #[test]
+    fn finalize_checked_accepts_matching_id() {
+        let mut inc = incoming_with(meta(7));
+        let m = finalize_decision_checked(&mut inc, 7).unwrap();
+        assert_eq!(m.id, 7);
+        assert!(inc.meta.is_none(), "meta must be consumed on a match");
     }
 
     // --- rolling-window speed estimate ---

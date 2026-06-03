@@ -172,7 +172,7 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
     match msg {
         SignalMsg::Create => {
             let room_id = gen_room_id();
-            let outcome = state.registry.lock().unwrap().create(peer, room_id);
+            let outcome = state.registry.lock().unwrap().create(peer, room_id, now_ms());
             if let JoinOutcome::Created(room) = outcome {
                 sig_log(peer, format_args!("created room={room}"));
                 state.send_to(peer, SignalMsg::Created { room });
@@ -199,7 +199,7 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
                 state.send_to(peer, SignalMsg::RoomNotFound);
                 return;
             }
-            let outcome = state.registry.lock().unwrap().create(peer, room);
+            let outcome = state.registry.lock().unwrap().create(peer, room, now);
             if let JoinOutcome::Created(room) = outcome {
                 sig_log(peer, format_args!("reclaimed room={room}"));
                 state.send_to(peer, SignalMsg::Created { room });
@@ -213,7 +213,7 @@ fn handle_message(state: &AppState, peer: PeerId, ip: IpAddr, msg: SignalMsg) {
                 state.send_to(peer, SignalMsg::RoomNotFound);
                 return;
             }
-            let outcome = state.registry.lock().unwrap().join(peer, &room);
+            let outcome = state.registry.lock().unwrap().join(peer, &room, now);
             match outcome {
                 JoinOutcome::Joined => {
                     let members = state.registry.lock().unwrap().debug_room_of(peer);

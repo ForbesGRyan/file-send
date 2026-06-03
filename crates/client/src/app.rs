@@ -9,6 +9,7 @@ use web_sys::{DragEvent, HtmlInputElement, RtcPeerConnection, RtcSdpType};
 
 use crate::protocol::FileStart;
 use crate::qr::qr_svg;
+use crate::reconnect::{step, Action, Event, Session};
 use crate::rows;
 use crate::signaling::Signaling;
 use crate::transfer::{Handlers, Transfer};
@@ -148,6 +149,15 @@ pub fn App() -> impl IntoView {
     // are sent on open.
     let pending: Rc<RefCell<Vec<(u64, web_sys::File)>>> = Rc::new(RefCell::new(Vec::new()));
 
+    // Reconnect decisions live in the pure `reconnect` reducer; this is the
+    // mutable session it reads/maintains, seeded from the URL + session storage.
+    let session: Rc<RefCell<Session>> = Rc::new(RefCell::new(Session {
+        room_in_hash: room_from_hash(),
+        owns: session_owns(),
+        reclaim_tried: false,
+        has_pc: false,
+    }));
+
     // Build the transfer event handlers. Each is a thin wrapper that applies a
     // pure `rows` transition inside `set_items.update`; the logic itself lives
     // in the `rows` module so it can be tested without a browser runtime.
@@ -220,6 +230,7 @@ pub fn App() -> impl IntoView {
         let sig = sig.clone();
         let wire_ctrl = wire_ctrl.clone();
         let transfer = transfer.clone();
+        let session = session.clone();
         Effect::new(move |_| {
             set_status.set(Status::Connecting);
 
@@ -269,41 +280,36 @@ pub fn App() -> impl IntoView {
                 })
             };
 
-            // Reclaim our own room at most once — only if a plain re-join finds it
-            // gone — so a failed reclaim can't loop.
-            let reclaim_tried = Rc::new(Cell::new(false));
+            // Holds the candidate from the most recent inbound `Ice` message so the
+            // `AddIce` action can apply it (the reducer event is payload-free).
+            let last_ice: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-            // Build signaling; route inbound messages. Roles are dynamic: whoever is
-            // already in the room when the other (re)joins is told to offer
-            // (`PeerJoined`); the arriving side answers. Both build a fresh connection
-            // for the handshake.
-            let signaling = match Signaling::connect({
+            // Execute one reducer action against the browser/Leptos world. This is
+            // the only place handshake side effects happen.
+            let execute: Rc<dyn Fn(Action)> = {
                 let build_pc = build_pc.clone();
                 let pc = pc.clone();
-                let sig_for_cb = sig.clone();
+                let sig_exec = sig.clone();
                 let wire_ctrl = wire_ctrl.clone();
                 let transfer = transfer.clone();
-                let reclaim_tried = reclaim_tried.clone();
-                move |msg| match msg {
-                    SignalMsg::Created { room } => {
-                        let link = format!("{}/#/room/{room}", public_origin());
-                        set_qr.set(qr_svg(&link));
-                        set_room_link.set(link);
-                        // Persist the room in the URL hash so a refresh rejoins the
-                        // same room instead of silently creating a brand-new one, and
-                        // remember (per tab) that we own it so the refresh reclaims it
-                        // rather than failing to join a torn-down room.
-                        let _ = web_sys::window()
-                            .unwrap()
-                            .location()
-                            .set_hash(&format!("/room/{room}"));
-                        set_session_owns(&room);
-                        set_room_code.set(room);
-                        set_status.set(Status::WaitingForPeer);
+                let last_ice = last_ice.clone();
+                Rc::new(move |action: Action| match action {
+                    Action::SendCreate => {
+                        if let Some(s) = sig_exec.borrow().as_ref() {
+                            s.send(&SignalMsg::Create);
+                        }
                     }
-                    SignalMsg::PeerJoined => {
-                        // We were already here, so we offer: build a fresh connection
-                        // with its own control channel and send the offer.
+                    Action::SendJoin { room } => {
+                        if let Some(s) = sig_exec.borrow().as_ref() {
+                            s.send(&SignalMsg::Join { room });
+                        }
+                    }
+                    Action::SendReclaim { room } => {
+                        if let Some(s) = sig_exec.borrow().as_ref() {
+                            s.send(&SignalMsg::Reclaim { room });
+                        }
+                    }
+                    Action::BuildPcAndOffer => {
                         crate::log::clog("[rtc] PeerJoined -> building pc + offering");
                         let Some(peer) = build_pc() else {
                             crate::log::clog("[rtc] PeerJoined: build_pc failed");
@@ -312,7 +318,7 @@ pub fn App() -> impl IntoView {
                         let channel =
                             webrtc::create_data_channel(&peer, crate::transfer::CTRL_LABEL);
                         wire_ctrl(peer.clone(), channel);
-                        let sig_for_cb = sig_for_cb.clone();
+                        let sig_for_cb = sig_exec.clone();
                         spawn_local(async move {
                             match webrtc::create_offer(&peer).await {
                                 Ok(sdp) => {
@@ -325,18 +331,15 @@ pub fn App() -> impl IntoView {
                             }
                         });
                     }
-                    SignalMsg::Sdp { sdp, kind } if kind == "offer" => {
-                        // The other side offered: answer on a fresh connection.
+                    Action::BuildPcAndAnswer { sdp } => {
                         crate::log::clog("[rtc] recv offer -> building pc + answering");
                         let Some(peer) = build_pc() else {
                             crate::log::clog("[rtc] recv offer: build_pc failed");
                             return;
                         };
-                        let sig_for_cb = sig_for_cb.clone();
+                        let sig_for_cb = sig_exec.clone();
                         spawn_local(async move {
                             if let Err(e) = webrtc::set_remote(&peer, RtcSdpType::Offer, &sdp).await {
-                                // Without a remote offer set, create_answer cannot
-                                // succeed — log and bail instead of swallowing it.
                                 crate::log::clog_val("[rtc] set_remote(offer) ERR", &e);
                                 return;
                             }
@@ -354,8 +357,7 @@ pub fn App() -> impl IntoView {
                             }
                         });
                     }
-                    SignalMsg::Sdp { sdp, .. } => {
-                        // An answer to the offer we sent.
+                    Action::SetRemoteAnswer { sdp } => {
                         crate::log::clog("[rtc] recv answer -> set_remote");
                         if let Some(peer) = pc.borrow().clone() {
                             spawn_local(async move {
@@ -368,7 +370,8 @@ pub fn App() -> impl IntoView {
                             crate::log::clog("[rtc] recv answer but no pc");
                         }
                     }
-                    SignalMsg::Ice { candidate } => {
+                    Action::AddIce => {
+                        let Some(candidate) = last_ice.borrow_mut().take() else { return };
                         if let Some(peer) = pc.borrow().clone() {
                             spawn_local(async move {
                                 if let Err(e) = webrtc::add_ice_candidate(&peer, &candidate).await {
@@ -379,38 +382,62 @@ pub fn App() -> impl IntoView {
                             crate::log::clog("[rtc] recv ICE but no pc yet");
                         }
                     }
-                    SignalMsg::PeerLeft => {
-                        // The partner vanished (perhaps mid-refresh). Drop the stale
-                        // connection so a reconnect starts clean; if they come back the
-                        // server re-sends PeerJoined / an offer and we re-handshake.
-                        crate::log::clog("[rtc] PeerLeft -> closing pc, status=PeerLeft");
+                    Action::TeardownPc => {
+                        crate::log::clog("[rtc] PeerLeft -> closing pc");
                         if let Some(peer) = pc.borrow_mut().take() {
                             peer.close();
                         }
                         *transfer.borrow_mut() = None;
-                        set_status.set(Status::PeerLeft);
                     }
-                    SignalMsg::RoomFull => set_status.set(Status::RoomFull),
-                    SignalMsg::RoomNotFound => {
-                        // A re-join found the room gone. If we own it, recreate it once
-                        // (a reload while we were the only peer); otherwise it is
-                        // genuinely unavailable.
-                        let owns = matches!(
-                            (room_from_hash(), session_owns()),
-                            (Some(h), Some(o)) if h == o
-                        );
-                        if owns && !reclaim_tried.get() {
-                            reclaim_tried.set(true);
-                            if let (Some(room), Some(s)) =
-                                (room_from_hash(), sig_for_cb.borrow().as_ref())
-                            {
-                                s.send(&SignalMsg::Reclaim { room });
-                            }
-                        } else {
-                            set_status.set(Status::RoomNotFound);
+                    Action::SetStatus(s) => set_status.set(s),
+                    Action::PersistRoom { room } => {
+                        let link = format!("{}/#/room/{room}", public_origin());
+                        set_qr.set(qr_svg(&link));
+                        set_room_link.set(link);
+                        let _ = web_sys::window()
+                            .unwrap()
+                            .location()
+                            .set_hash(&format!("/room/{room}"));
+                        set_session_owns(&room);
+                        set_room_code.set(room);
+                    }
+                })
+            };
+
+            // Build signaling; route inbound messages. Roles are dynamic: whoever is
+            // already in the room when the other (re)joins is told to offer
+            // (`PeerJoined`); the arriving side answers. Both build a fresh connection
+            // for the handshake. Every inbound message becomes a reducer `Event`; the
+            // pure reducer decides what to do and `execute` performs it.
+            let signaling = match Signaling::connect({
+                let last_ice = last_ice.clone();
+                let session = session.clone();
+                let execute = execute.clone();
+                move |msg| {
+                    // Translate the wire message into a reducer event. Messages
+                    // with no handshake decision (server-originated echoes) map to
+                    // nothing and are ignored.
+                    let ev = match msg {
+                        SignalMsg::Created { room } => Some(Event::Created { room }),
+                        SignalMsg::PeerJoined => Some(Event::PeerJoined),
+                        SignalMsg::Sdp { sdp, kind } if kind == "offer" => {
+                            Some(Event::Offer { sdp })
                         }
+                        SignalMsg::Sdp { sdp, .. } => Some(Event::Answer { sdp }),
+                        SignalMsg::Ice { candidate } => {
+                            *last_ice.borrow_mut() = Some(candidate);
+                            Some(Event::Ice)
+                        }
+                        SignalMsg::PeerLeft => Some(Event::PeerLeft),
+                        SignalMsg::RoomFull => Some(Event::RoomFull),
+                        SignalMsg::RoomNotFound => Some(Event::RoomNotFound),
+                        _ => None,
+                    };
+                    let Some(ev) = ev else { return };
+                    let actions = step(&mut session.borrow_mut(), ev);
+                    for action in actions {
+                        execute(action);
                     }
-                    _ => {}
                 }
             }) {
                 Ok(s) => s,
@@ -420,14 +447,14 @@ pub fn App() -> impl IntoView {
                 }
             };
 
-            // On open: create a fresh room (no code in the URL) or (re)join the room
-            // in the URL. A reload always tries to re-join first — reconnecting to a
-            // partner who is still there — and only recreates the room if that join
-            // finds it gone (handled in RoomNotFound above).
-            let sig_open = signaling.clone();
-            signaling.on_open(move || match room_from_hash() {
-                None => sig_open.send(&SignalMsg::Create),
-                Some(room) => sig_open.send(&SignalMsg::Join { room }),
+            // On open, let the reducer decide Create vs (re)Join from the session.
+            let session_open = session.clone();
+            let execute_open = execute.clone();
+            signaling.on_open(move || {
+                let actions = step(&mut session_open.borrow_mut(), Event::Open);
+                for action in actions {
+                    execute_open(action);
+                }
             });
 
             *sig.borrow_mut() = Some(signaling);
