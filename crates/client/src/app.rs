@@ -280,6 +280,20 @@ pub fn App() -> impl IntoView {
                 })
             };
 
+            // Close the current peer connection and drop the transfer. Shared by
+            // the reducer's `TeardownPc` action and the signaling `on_disconnect`
+            // reset so the teardown logic lives in one place.
+            let teardown_pc: Rc<dyn Fn()> = {
+                let pc = pc.clone();
+                let transfer = transfer.clone();
+                Rc::new(move || {
+                    if let Some(peer) = pc.borrow_mut().take() {
+                        peer.close();
+                    }
+                    *transfer.borrow_mut() = None;
+                })
+            };
+
             // Holds the candidate from the most recent inbound `Ice` message so the
             // `AddIce` action can apply it (the reducer event is payload-free).
             let last_ice: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -291,8 +305,8 @@ pub fn App() -> impl IntoView {
                 let pc = pc.clone();
                 let sig_exec = sig.clone();
                 let wire_ctrl = wire_ctrl.clone();
-                let transfer = transfer.clone();
                 let last_ice = last_ice.clone();
+                let teardown_pc = teardown_pc.clone();
                 Rc::new(move |action: Action| match action {
                     Action::SendCreate => {
                         if let Some(s) = sig_exec.borrow().as_ref() {
@@ -384,10 +398,7 @@ pub fn App() -> impl IntoView {
                     }
                     Action::TeardownPc => {
                         crate::log::clog("[rtc] PeerLeft -> closing pc");
-                        if let Some(peer) = pc.borrow_mut().take() {
-                            peer.close();
-                        }
-                        *transfer.borrow_mut() = None;
+                        teardown_pc();
                     }
                     Action::SetStatus(s) => set_status.set(s),
                     Action::PersistRoom { room } => {
@@ -446,6 +457,24 @@ pub fn App() -> impl IntoView {
                     return;
                 }
             };
+
+            // On an unexpected socket drop: surface "Reconnecting", cancel any
+            // in-flight transfers (the data channel died with the socket), tear
+            // down the stale pc, and reset the session so the reconnect handshake
+            // starts clean. `Signaling` then reconnects (backoff / `online`) and
+            // fires `on_open`, which re-Joins the room via the reducer.
+            {
+                let teardown_pc = teardown_pc.clone();
+                let session = session.clone();
+                signaling.on_disconnect(move || {
+                    set_status.set(Status::Reconnecting);
+                    set_items.update(|list| rows::mark_all_active_cancelled(list));
+                    teardown_pc();
+                    let mut s = session.borrow_mut();
+                    s.has_pc = false;
+                    s.reclaim_tried = false;
+                });
+            }
 
             // On open, let the reducer decide Create vs (re)Join from the session.
             let session_open = session.clone();

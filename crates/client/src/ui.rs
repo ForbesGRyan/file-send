@@ -10,6 +10,7 @@ pub enum Status {
     WaitingForPeer,
     Connecting,
     Connected,
+    Reconnecting,
     PeerLeft,
     RoomFull,
     RoomNotFound,
@@ -23,6 +24,7 @@ impl Status {
             Status::WaitingForPeer => "Waiting for peer to join…".into(),
             Status::Connecting => "Connecting…".into(),
             Status::Connected => "Connected — ready to transfer".into(),
+            Status::Reconnecting => "Reconnecting…".into(),
             Status::PeerLeft => "Peer disconnected".into(),
             Status::RoomFull => "Room is full".into(),
             Status::RoomNotFound => "Room not found or expired".into(),
@@ -410,6 +412,7 @@ mod tests {
         assert_eq!(Status::PeerLeft.label(), "Peer disconnected");
         assert_eq!(Status::RoomFull.label(), "Room is full");
         assert_eq!(Status::RoomNotFound.label(), "Room not found or expired");
+        assert_eq!(Status::Reconnecting.label(), "Reconnecting…");
         assert_eq!(
             Status::Error("boom".into()).label(),
             "Couldn't establish direct connection: boom"

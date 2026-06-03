@@ -171,6 +171,18 @@ pub fn mark_cancelled_remote(list: &mut [Row], id: u64) {
     }
 }
 
+/// Mark every in-flight (`Active`) row — incoming or outgoing — as `Cancelled`.
+/// Used when the signaling connection drops mid-transfer: the data channel dies
+/// with it, so any active transfer is dead and cannot resume. Leaves
+/// `Done`/`Offered`/`Pending`/`Declined`/`Cancelled` rows untouched.
+pub fn mark_all_active_cancelled(list: &mut [Row]) {
+    for r in list.iter_mut() {
+        if r.state == TransferState::Active {
+            r.state = TransferState::Cancelled;
+        }
+    }
+}
+
 /// Locally accept an incoming offer: leave Offered so the buttons hide.
 pub fn accept(list: &mut [Row], id: u64) {
     if let Some(r) = list.iter_mut().find(|r| r.id == id && r.incoming) {
@@ -360,6 +372,27 @@ mod tests {
         incoming_offer(&mut list, &meta(2, "b", 1.0));
         decline(&mut list, 2);
         assert!(list.iter().all(|r| r.id != 2));
+    }
+
+    #[test]
+    fn mark_all_active_cancelled_hits_only_active_rows() {
+        let mut list = Vec::new();
+        // An active incoming download and an active outgoing send.
+        recv_progress(&mut list, 1, "in", 30.0, 100.0, 0.0); // Active incoming
+        send_progress(&mut list, 2, "out", 40.0, 100.0); // Active outgoing
+        // Rows that must be left alone:
+        send_progress(&mut list, 3, "done", 100.0, 100.0); // Done
+        incoming_offer(&mut list, &meta(4, "offered", 1.0)); // Offered
+        push_outgoing_pending(&mut list, 5, "pending", 1.0); // Pending
+
+        mark_all_active_cancelled(&mut list);
+
+        let by_id = |id: u64| list.iter().find(|r| r.id == id).unwrap().state.clone();
+        assert_eq!(by_id(1), TransferState::Cancelled);
+        assert_eq!(by_id(2), TransferState::Cancelled);
+        assert_eq!(by_id(3), TransferState::Done); // untouched
+        assert_eq!(by_id(4), TransferState::Offered); // untouched
+        assert_eq!(by_id(5), TransferState::Pending); // untouched
     }
 
     #[test]
