@@ -20,10 +20,15 @@ export default defineConfig({
   projects: [{ name: "chromium", use: { browserName: "chromium" } }],
   webServer: {
     // Build the WASM client, then run the real server binary serving dist.
+    // The `&&`/`cd` chain runs under the OS shell (cmd.exe on Windows, sh on
+    // Linux CI) — both support it.
     command:
       "cd ../crates/client && trunk build && cd ../.. && cargo run --release -p server",
     url: BASE_URL,
     timeout: 180_000,
+    // Locally, reuse an already-running :3100 server for fast reruns. NB: this
+    // SKIPS the trunk build, so kill a stale server before testing new client
+    // code. CI sets process.env.CI, so it always does a fresh build.
     reuseExistingServer: !process.env.CI,
     env: {
       BIND_ADDR: `127.0.0.1:${PORT}`,
