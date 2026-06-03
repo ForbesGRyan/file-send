@@ -122,8 +122,22 @@ pub fn step(s: &mut Session, ev: Event) -> Vec<Action> {
             ]
         }
         Event::RoomFull => vec![Action::SetStatus(Status::RoomFull)],
-        // RoomNotFound is added in Task 4.
-        Event::RoomNotFound => vec![],
+        Event::RoomNotFound => {
+            // Only the tab that created this exact room may reclaim it, and only
+            // once — so a refused reclaim (which returns RoomNotFound again)
+            // cannot loop, and a guessed code cannot trigger a reclaim.
+            let is_owner = matches!(
+                (&s.room_in_hash, &s.owns),
+                (Some(h), Some(o)) if h == o
+            );
+            if is_owner && !s.reclaim_tried {
+                s.reclaim_tried = true;
+                let room = s.room_in_hash.clone().expect("owner has a hash room");
+                vec![Action::SendReclaim { room }]
+            } else {
+                vec![Action::SetStatus(Status::RoomNotFound)]
+            }
+        }
     }
 }
 
@@ -215,6 +229,58 @@ mod tests {
         assert_eq!(
             step(&mut s, Event::RoomFull),
             vec![Action::SetStatus(Status::RoomFull)]
+        );
+    }
+
+    /// Helper: an owner reloading — hash and ownership agree on the same room.
+    fn owner_reload(room: &str) -> Session {
+        Session { room_in_hash: Some(room.into()), owns: Some(room.into()), ..Session::default() }
+    }
+
+    #[test]
+    fn owner_reclaims_a_vanished_room_once() {
+        let mut s = owner_reload("k7m4qp");
+        // Reload tried Join first; the room was torn down -> RoomNotFound.
+        assert_eq!(
+            step(&mut s, Event::RoomNotFound),
+            vec![Action::SendReclaim { room: "k7m4qp".into() }]
+        );
+        assert!(s.reclaim_tried);
+    }
+
+    #[test]
+    fn second_room_not_found_does_not_reclaim_again() {
+        let mut s = owner_reload("k7m4qp");
+        let _ = step(&mut s, Event::RoomNotFound); // first -> reclaim
+        // A reclaim that was refused comes back as RoomNotFound; do NOT loop.
+        assert_eq!(
+            step(&mut s, Event::RoomNotFound),
+            vec![Action::SetStatus(Status::RoomNotFound)]
+        );
+    }
+
+    #[test]
+    fn non_owner_never_reclaims() {
+        // A joiner has the room in the URL but never owned it.
+        let mut s = Session { room_in_hash: Some("k7m4qp".into()), owns: None, ..Session::default() };
+        assert_eq!(
+            step(&mut s, Event::RoomNotFound),
+            vec![Action::SetStatus(Status::RoomNotFound)]
+        );
+        assert!(!s.reclaim_tried, "a non-owner must not attempt a reclaim");
+    }
+
+    #[test]
+    fn owner_of_a_different_room_does_not_reclaim() {
+        // Hash and ownership disagree -> not the owner of *this* room.
+        let mut s = Session {
+            room_in_hash: Some("k7m4qp".into()),
+            owns: Some("other9".into()),
+            ..Session::default()
+        };
+        assert_eq!(
+            step(&mut s, Event::RoomNotFound),
+            vec![Action::SetStatus(Status::RoomNotFound)]
         );
     }
 }
