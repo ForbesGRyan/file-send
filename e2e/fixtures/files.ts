@@ -25,10 +25,27 @@ export async function sendFile(page: Page, name: string, content: Buffer, mimeTy
   await page.locator('input[type=file]').setInputFiles({ name, mimeType, buffer: content });
 }
 
-/** Wait for the receiver's auto-download and assert its bytes hash-match `expected`. */
-export async function expectDownloadMatches(page: Page, expected: Buffer) {
-  const download = await page.waitForEvent("download");
+/**
+ * Run `trigger` (the action that causes the receiver to download — usually the
+ * Accept click) and assert the resulting download's bytes hash-match `expected`.
+ * The download listener is registered BEFORE `trigger` runs (via Promise.all)
+ * so a fast small-file download can't fire before we're listening.
+ */
+export async function expectDownloadMatches(
+  page: Page,
+  expected: Buffer,
+  trigger: () => Promise<void>,
+) {
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    trigger(),
+  ]);
   const path = await download.path();
+  if (path === null) {
+    throw new Error(
+      "download.path() returned null — was acceptDownloads: true set on this context?",
+    );
+  }
   const got = await readFile(path);
   expect(sha256(got)).toBe(sha256(expected));
 }
