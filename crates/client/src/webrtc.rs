@@ -107,6 +107,39 @@ pub fn create_data_channel(pc: &RtcPeerConnection, label: &str) -> RtcDataChanne
     pc.create_data_channel(label)
 }
 
+/// Log connection- and ICE-state transitions to the console. Temporary
+/// instrumentation for the sleep/reconnect investigation: reveals whether a
+/// re-handshake's SDP succeeds but ICE then fails to (re)connect, versus never
+/// getting that far. Reads the state as a string via reflection so it needs no
+/// extra web-sys enum features. Remove once the root cause is fixed.
+pub fn log_state_changes(pc: &RtcPeerConnection) {
+    fn state(pc: &RtcPeerConnection, prop: &str) -> String {
+        js_sys::Reflect::get(pc, &JsValue::from_str(prop))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "?".into())
+    }
+    {
+        let pc2 = pc.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            crate::log::clog(&format!("[rtc] connectionState={}", state(&pc2, "connectionState")));
+        });
+        pc.set_onconnectionstatechange(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+    {
+        let pc2 = pc.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            crate::log::clog(&format!(
+                "[rtc] iceConnectionState={}",
+                state(&pc2, "iceConnectionState")
+            ));
+        });
+        pc.set_oniceconnectionstatechange(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    }
+}
+
 /// Register a handler for the data channel created by the remote (joiner side).
 pub fn on_data_channel(pc: &RtcPeerConnection, on_dc: impl Fn(RtcDataChannel) + 'static) {
     let cb = Closure::<dyn FnMut(web_sys::RtcDataChannelEvent)>::new(

@@ -1,5 +1,6 @@
 mod app;
 mod filetype;
+mod log;
 mod protocol;
 mod qr;
 mod rows;

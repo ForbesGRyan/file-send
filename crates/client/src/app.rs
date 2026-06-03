@@ -240,6 +240,7 @@ pub fn App() -> impl IntoView {
                             return None;
                         }
                     };
+                    webrtc::log_state_changes(&peer);
                     // Inbound channels routed by label: the control channel to
                     // wire_ctrl, a per-file channel to the active transfer.
                     {
@@ -303,51 +304,86 @@ pub fn App() -> impl IntoView {
                     SignalMsg::PeerJoined => {
                         // We were already here, so we offer: build a fresh connection
                         // with its own control channel and send the offer.
-                        let Some(peer) = build_pc() else { return };
+                        crate::log::clog("[rtc] PeerJoined -> building pc + offering");
+                        let Some(peer) = build_pc() else {
+                            crate::log::clog("[rtc] PeerJoined: build_pc failed");
+                            return;
+                        };
                         let channel =
                             webrtc::create_data_channel(&peer, crate::transfer::CTRL_LABEL);
                         wire_ctrl(peer.clone(), channel);
                         let sig_for_cb = sig_for_cb.clone();
                         spawn_local(async move {
-                            if let Ok(sdp) = webrtc::create_offer(&peer).await {
-                                if let Some(s) = sig_for_cb.borrow().as_ref() {
-                                    s.send(&SignalMsg::Sdp { sdp, kind: "offer".into() });
+                            match webrtc::create_offer(&peer).await {
+                                Ok(sdp) => {
+                                    if let Some(s) = sig_for_cb.borrow().as_ref() {
+                                        s.send(&SignalMsg::Sdp { sdp, kind: "offer".into() });
+                                        crate::log::clog("[rtc] sent offer");
+                                    }
                                 }
+                                Err(e) => crate::log::clog_val("[rtc] create_offer ERR", &e),
                             }
                         });
                     }
                     SignalMsg::Sdp { sdp, kind } if kind == "offer" => {
                         // The other side offered: answer on a fresh connection.
-                        let Some(peer) = build_pc() else { return };
+                        crate::log::clog("[rtc] recv offer -> building pc + answering");
+                        let Some(peer) = build_pc() else {
+                            crate::log::clog("[rtc] recv offer: build_pc failed");
+                            return;
+                        };
                         let sig_for_cb = sig_for_cb.clone();
                         spawn_local(async move {
-                            let _ = webrtc::set_remote(&peer, RtcSdpType::Offer, &sdp).await;
-                            if let Ok(answer) = webrtc::create_answer(&peer).await {
-                                if let Some(s) = sig_for_cb.borrow().as_ref() {
-                                    s.send(&SignalMsg::Sdp { sdp: answer, kind: "answer".into() });
+                            if let Err(e) = webrtc::set_remote(&peer, RtcSdpType::Offer, &sdp).await {
+                                // Without a remote offer set, create_answer cannot
+                                // succeed — log and bail instead of swallowing it.
+                                crate::log::clog_val("[rtc] set_remote(offer) ERR", &e);
+                                return;
+                            }
+                            crate::log::clog("[rtc] set_remote(offer) ok");
+                            match webrtc::create_answer(&peer).await {
+                                Ok(answer) => {
+                                    if let Some(s) = sig_for_cb.borrow().as_ref() {
+                                        s.send(&SignalMsg::Sdp { sdp: answer, kind: "answer".into() });
+                                        crate::log::clog("[rtc] sent answer");
+                                    } else {
+                                        crate::log::clog("[rtc] no signaling to send answer");
+                                    }
                                 }
+                                Err(e) => crate::log::clog_val("[rtc] create_answer ERR", &e),
                             }
                         });
                     }
                     SignalMsg::Sdp { sdp, .. } => {
                         // An answer to the offer we sent.
+                        crate::log::clog("[rtc] recv answer -> set_remote");
                         if let Some(peer) = pc.borrow().clone() {
                             spawn_local(async move {
-                                let _ = webrtc::set_remote(&peer, RtcSdpType::Answer, &sdp).await;
+                                match webrtc::set_remote(&peer, RtcSdpType::Answer, &sdp).await {
+                                    Ok(_) => crate::log::clog("[rtc] set_remote(answer) ok"),
+                                    Err(e) => crate::log::clog_val("[rtc] set_remote(answer) ERR", &e),
+                                }
                             });
+                        } else {
+                            crate::log::clog("[rtc] recv answer but no pc");
                         }
                     }
                     SignalMsg::Ice { candidate } => {
                         if let Some(peer) = pc.borrow().clone() {
                             spawn_local(async move {
-                                let _ = webrtc::add_ice_candidate(&peer, &candidate).await;
+                                if let Err(e) = webrtc::add_ice_candidate(&peer, &candidate).await {
+                                    crate::log::clog_val("[rtc] add_ice_candidate ERR", &e);
+                                }
                             });
+                        } else {
+                            crate::log::clog("[rtc] recv ICE but no pc yet");
                         }
                     }
                     SignalMsg::PeerLeft => {
                         // The partner vanished (perhaps mid-refresh). Drop the stale
                         // connection so a reconnect starts clean; if they come back the
                         // server re-sends PeerJoined / an offer and we re-handshake.
+                        crate::log::clog("[rtc] PeerLeft -> closing pc, status=PeerLeft");
                         if let Some(peer) = pc.borrow_mut().take() {
                             peer.close();
                         }
@@ -515,6 +551,10 @@ pub fn App() -> impl IntoView {
                     }
                 }
             }
+            // Clear the input so re-selecting the SAME file fires `change` again.
+            // A file input only emits `change` when its value differs from last
+            // time; without this reset, picking the just-sent file is a no-op.
+            input.set_value("");
             on_files(files);
         }
     };
